@@ -10,18 +10,8 @@ app.use(cors());
 console.log('Starting License Plate OCR Backend...');
 
 app.post('/process-frame', (req, res) => {
-  // TEMPORARY: Read from specific debug image
-  const fs = require('fs');
-  const testImagePath = '/private/tmp/ocr_debug/1_raw_20251016_015923_485905.jpg';
-  
-  let frame;
-  try {
-    const imageBuffer = fs.readFileSync(testImagePath);
-    frame = imageBuffer.toString('base64');
-    console.log(`Loaded test image: ${testImagePath}`);
-  } catch (err) {
-    return res.status(500).json({ error: `Could not read test image: ${err.message}` });
-  }
+  // Get frame from phone camera (sent via request body)
+  const { frame } = req.body;
 
   if (!frame) {
     return res.status(400).json({ error: 'No frame provided' });
