@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView, Image } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 
 interface Classification {
@@ -14,12 +14,17 @@ interface Classification {
 export default function OCRScreen() {
   const cameraRef = useRef<CameraView>(null);
   const [permission, requestPermission] = useCameraPermissions();
+  
+  // State declarations
   const [isProcessing, setIsProcessing] = useState(false);
   const [captureCount, setCaptureCount] = useState(0);
   const [lastQuality, setLastQuality] = useState('');
   const [classification, setClassification] = useState<Classification | null>(null);
   const [rawText, setRawText] = useState('');
   const [confidence, setConfidence] = useState(0);
+  const [lastPhoto, setLastPhoto] = useState<string | null>(null);
+  const [debugImages, setDebugImages] = useState<Array<{name: string, data: string}>>([]);
+  const [currentDebugImageIndex, setCurrentDebugImageIndex] = useState(0);
 
   const BACKEND_URL = 'http://10.0.0.38:5001';
 
@@ -37,10 +42,8 @@ export default function OCRScreen() {
       setClassification(null);
       setRawText('Focusing...');
 
-      // Wait 500ms for camera to focus
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Capture at maximum quality
       const photo = await cameraRef.current.takePictureAsync({
         quality: 1.0,
         base64: true,
@@ -50,9 +53,9 @@ export default function OCRScreen() {
         throw new Error('Failed to capture photo');
       }
 
+      setLastPhoto(`data:image/jpg;base64,${photo.base64}`);
       setRawText('Sending to server...');
 
-      // Send to backend
       const response = await fetch(`${BACKEND_URL}/process-frame`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -65,6 +68,8 @@ export default function OCRScreen() {
         setConfidence(data.confidence || 0);
         setClassification(data.classification || null);
         setLastQuality(data.quality_status || '');
+        setDebugImages(data.debug_images || []);
+        setCurrentDebugImageIndex(0);
         setCaptureCount(c => c + 1);
       } else {
         setRawText('Backend error');
@@ -75,6 +80,16 @@ export default function OCRScreen() {
       setRawText('Error: ' + String(err));
       setIsProcessing(false);
     }
+  };
+
+  const handleCaptureNewPlate = () => {
+    setLastPhoto(null);
+    setRawText('');
+    setConfidence(0);
+    setClassification(null);
+    setLastQuality('');
+    setDebugImages([]);
+    setCurrentDebugImageIndex(0);
   };
 
   if (!permission) {
@@ -95,33 +110,71 @@ export default function OCRScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Camera */}
-      <CameraView ref={cameraRef} style={styles.camera} facing="back">
-        <View style={styles.cameraOverlay}>
-          <View style={styles.focusGuide}>
-            <Text style={styles.focusText}>Position license plate here</Text>
-          </View>
+      {/* Camera or Debug Section */}
+      {!lastPhoto ? (
+        <CameraView ref={cameraRef} style={styles.camera} facing="back">
+          <View style={styles.cameraOverlay}>
+            <View style={styles.focusGuide}>
+              <Text style={styles.focusText}>Position license plate here</Text>
+            </View>
 
-          <View style={styles.guidanceContainer}>
-            <Text style={styles.guidanceText}>✓ Good lighting</Text>
-            <Text style={styles.guidanceText}>✓ Straight angle</Text>
-            <Text style={styles.guidanceText}>✓ 1-2 feet away</Text>
-            <Text style={styles.guidanceText}>✓ Keep steady</Text>
+            <View style={styles.guidanceContainer}>
+              <Text style={styles.guidanceText}>✓ Good lighting</Text>
+              <Text style={styles.guidanceText}>✓ Straight angle</Text>
+              <Text style={styles.guidanceText}>✓ 1-2 feet away</Text>
+              <Text style={styles.guidanceText}>✓ Keep steady</Text>
+            </View>
           </View>
+        </CameraView>
+      ) : (
+        <View style={styles.debugSection}>
+          {debugImages.length > 0 ? (
+            <>
+              <View style={styles.debugImageInfo}>
+                <Text style={styles.debugImageLabel}>
+                  {debugImages[currentDebugImageIndex]?.name}
+                </Text>
+                <Text style={styles.debugImageCounter}>
+                  {currentDebugImageIndex + 1} of {debugImages.length}
+                </Text>
+              </View>
+              
+              <View style={styles.debugImageDisplay}>
+                <Image
+                  source={{ uri: `data:image/jpg;base64,${debugImages[currentDebugImageIndex]?.data}` }}
+                  style={styles.debugImage}
+                />
+              </View>
+              
+              <View style={styles.debugImageNav}>
+                <TouchableOpacity
+                  onPress={() => setCurrentDebugImageIndex(Math.max(0, currentDebugImageIndex - 1))}
+                  disabled={currentDebugImageIndex === 0}
+                >
+                  <Text style={styles.navButton}>← Prev</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setCurrentDebugImageIndex(Math.min(debugImages.length - 1, currentDebugImageIndex + 1))}
+                  disabled={currentDebugImageIndex === debugImages.length - 1}
+                >
+                  <Text style={styles.navButton}>Next →</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : (
+            <Text style={styles.debugLabel}>Processing...</Text>
+          )}
         </View>
-      </CameraView>
+      )}
 
       {/* Results Panel */}
       <ScrollView style={styles.resultsPanel}>
-        {/* Quality Status */}
         {lastQuality && (
           <Text style={styles.qualityText}>{lastQuality}</Text>
         )}
 
-        {/* Classification Results */}
         {classification && (
           <View style={styles.classificationContainer}>
-            {/* State Info */}
             {classification.state && (
               <View style={styles.infoBlock}>
                 <Text style={styles.blockLabel}>STATE</Text>
@@ -132,7 +185,6 @@ export default function OCRScreen() {
               </View>
             )}
 
-            {/* License Number */}
             {classification.license_number && (
               <View style={styles.infoBlock}>
                 <Text style={styles.blockLabel}>LICENSE PLATE</Text>
@@ -140,7 +192,6 @@ export default function OCRScreen() {
               </View>
             )}
 
-            {/* Expiration Date */}
             {classification.expiration_date && (
               <View style={styles.infoBlock}>
                 <Text style={styles.blockLabel}>EXPIRATION</Text>
@@ -148,7 +199,6 @@ export default function OCRScreen() {
               </View>
             )}
 
-            {/* State Slogan */}
             {classification.slogan && (
               <View style={styles.infoBlock}>
                 <Text style={styles.blockLabel}>STATE MOTTO</Text>
@@ -156,7 +206,6 @@ export default function OCRScreen() {
               </View>
             )}
 
-            {/* Other Text */}
             {classification.other_text && classification.other_text.length > 0 && (
               <View style={styles.infoBlock}>
                 <Text style={styles.blockLabel}>OTHER TEXT</Text>
@@ -166,7 +215,6 @@ export default function OCRScreen() {
           </View>
         )}
 
-        {/* Raw Text and Confidence */}
         <View style={styles.rawDataBlock}>
           <Text style={styles.blockLabel}>RAW TEXT</Text>
           <Text style={styles.rawText} numberOfLines={4}>{rawText}</Text>
@@ -188,24 +236,31 @@ export default function OCRScreen() {
           )}
         </View>
 
-        {/* Capture Stats */}
         <Text style={styles.statsText}>Captures: {captureCount}</Text>
       </ScrollView>
 
-      {/* Capture Button */}
+      {/* Buttons */}
       <View style={styles.buttonContainer}>
-        <TouchableOpacity
-          style={[styles.button, isProcessing && styles.buttonDisabled]}
-          onPress={handleTakePhoto}
-          disabled={isProcessing}
-        >
-          <Text style={styles.buttonText}>
-            {isProcessing ? 'Processing...' : 'Capture & Analyze'}
-          </Text>
-        </TouchableOpacity>
+        {!lastPhoto ? (
+          <TouchableOpacity
+            style={[styles.button, isProcessing && styles.buttonDisabled]}
+            onPress={handleTakePhoto}
+            disabled={isProcessing}
+          >
+            <Text style={styles.buttonText}>
+              {isProcessing ? 'Processing...' : '📸 Capture & Analyze'}
+            </Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            style={styles.button}
+            onPress={handleCaptureNewPlate}
+          >
+            <Text style={styles.buttonText}>📷 Capture New Plate</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
-      {/* Loading Overlay */}
       {isProcessing && (
         <View style={styles.loadingOverlay}>
           <ActivityIndicator size="large" color="#FFF" />
@@ -262,8 +317,65 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginVertical: 3,
   },
+  debugSection: {
+    flex: 0.5,
+    backgroundColor: '#1a1a1a',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  debugLabel: {
+    color: '#00FF00',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  debugImageInfo: {
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  debugImageLabel: {
+    color: '#00FF00',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
+  debugImageCounter: {
+    color: '#888',
+    fontSize: 11,
+    marginTop: 4,
+  },
+  debugImageDisplay: {
+    flex: 1,
+    width: '100%',
+    backgroundColor: '#000',
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#00FF00',
+    marginVertical: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    overflow: 'hidden',
+  },
+  debugImage: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'contain',
+  },
+  debugImageNav: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    width: '100%',
+    paddingHorizontal: 20,
+  },
+  navButton: {
+    color: '#00FF00',
+    fontSize: 12,
+    fontWeight: 'bold',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
   resultsPanel: {
-    flex: 0.45,
+    flex: 0.4,
     backgroundColor: '#1a1a1a',
     padding: 14,
   },
