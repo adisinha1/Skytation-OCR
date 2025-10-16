@@ -1,0 +1,28 @@
+# Core dependencies
+opencv-python==4.10.0.84
+numpy==1.26.4
+Pillow==10.4.0
+
+# YOLO for detection
+ultralytics==8.2.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# For labeling and visualization
+matplotlib==3.9.0
+
+# For data augmentation (optional, comment out if issues persist)
+albumentations==1.4.0
+
+# OCR (install these later when needed)
+# easyocr==1.7.0
+# pytesseract==0.3.10
+
+# Utilities
+pyyaml==6.0.1
+tqdm==4.66.0
+pandas==2.2.0
+
+# For notebooks (optional)
+# jupyter==1.0.0
+# ipywidgets==8.1.0

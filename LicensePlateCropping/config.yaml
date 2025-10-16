@@ -1,0 +1,36 @@
+# License Plate Detection Configuration
+
+# Model settings
+model:
+  type: "yolov8n" # Can be yolov8n, yolov8s, yolov8m, yolov8l
+  input_size: 640
+  confidence_threshold: 0.5
+  iou_threshold: 0.4
+
+# Training settings
+training:
+  epochs: 500
+  batch_size: 16
+  learning_rate: 0.001
+  device: "cpu" # Change to "cuda" if you have GPU
+
+# Dataset paths
+paths:
+  raw_images: "data/raw_images"
+  annotations: "data/annotations"
+  cropped_plates: "data/cropped_plates"
+  model_weights: "models/weights"
+  best_model: "models/weights/best_plate_detector.pt"
+
+# Image preprocessing
+preprocessing:
+  resize: True
+  target_size: [640, 640]
+  normalize: True
+  augmentation: True
+
+# OCR settings (for future integration)
+ocr:
+  enabled: False
+  language: "en"
+  min_confidence: 0.8
