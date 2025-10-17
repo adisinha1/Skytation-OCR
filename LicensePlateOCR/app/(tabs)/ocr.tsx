@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView, Image } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { saveScan } from '@/app/scanStorage';
 
 interface Classification {
   state: string | null;
@@ -26,7 +27,7 @@ export default function OCRScreen() {
   const [debugImages, setDebugImages] = useState<Array<{name: string, data: string}>>([]);
   const [currentDebugImageIndex, setCurrentDebugImageIndex] = useState(0);
 
-  const BACKEND_URL = 'http://10.0.0.38:5001';
+  const BACKEND_URL = 'http://10.0.0.67:5001';
 
   React.useEffect(() => {
     if (!permission?.granted) {
@@ -71,6 +72,14 @@ export default function OCRScreen() {
         setDebugImages(data.debug_images || []);
         setCurrentDebugImageIndex(0);
         setCaptureCount(c => c + 1);
+        
+        if (data.classification?.license_number && photo?.base64) {
+          await saveScan({
+            licenseNumber: data.classification.license_number,
+            stateAbbreviation: data.classification.state_abbreviation,
+            image: `data:image/jpg;base64,${photo.base64}`,
+          });
+        }
       } else {
         setRawText('Backend error');
       }
@@ -119,10 +128,6 @@ export default function OCRScreen() {
             </View>
 
             <View style={styles.guidanceContainer}>
-              <Text style={styles.guidanceText}>✓ Good lighting</Text>
-              <Text style={styles.guidanceText}>✓ Straight angle</Text>
-              <Text style={styles.guidanceText}>✓ 1-2 feet away</Text>
-              <Text style={styles.guidanceText}>✓ Keep steady</Text>
             </View>
           </View>
         </CameraView>

@@ -1,13 +1,46 @@
 import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import { StyleSheet, ScrollView, TouchableOpacity, View } from 'react-native';
+import { useState, useCallback } from 'react';
+import { useFocusEffect } from 'expo-router';
 
-import { HelloWave } from '@/components/hello-wave';
 import ParallaxScrollView from '@/components/parallax-scroll-view';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+import { getScans, clearScans, ScanRecord } from '@/app/scanStorage';
 
 export default function HomeScreen() {
+  const [scans, setScans] = useState<ScanRecord[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const loadScans = async () => {
+    setIsLoading(true);
+    const scanHistory = await getScans();
+    setScans(scanHistory);
+    setIsLoading(false);
+  };
+
+  // Reload scans whenever the screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      loadScans();
+    }, [])
+  );
+
+  const handleClearHistory = async () => {
+    await clearScans();
+    setScans([]);
+  };
+
+  const formatDate = (timestamp: number) => {
+    const date = new Date(timestamp);
+    return date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
+
   return (
     <ParallaxScrollView
       headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
@@ -18,62 +51,60 @@ export default function HomeScreen() {
         />
       }>
       <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
+        <ThemedText type="title">Scan History</ThemedText>
       </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
-              />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
 
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
+      <ThemedView style={styles.headerRow}>
+        <ThemedText type="subtitle">Recent Scans</ThemedText>
+        {scans.length > 0 && (
+          <TouchableOpacity onPress={handleClearHistory} style={styles.clearButton}>
+            <ThemedText style={styles.clearButtonText}>Clear All</ThemedText>
+          </TouchableOpacity>
+        )}
       </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
+
+      {isLoading ? (
+        <ThemedView style={styles.emptyContainer}>
+          <ThemedText>Loading...</ThemedText>
+        </ThemedView>
+      ) : scans.length === 0 ? (
+        <ThemedView style={styles.emptyContainer}>
+          <ThemedText style={styles.emptyText}>No scans yet</ThemedText>
+          <ThemedText style={styles.emptySubtext}>
+            Go to the OCR tab to scan your first license plate
+          </ThemedText>
+        </ThemedView>
+      ) : (
+        <ScrollView style={styles.scanList}>
+          {scans.map((scan) => (
+            <ThemedView key={scan.id} style={styles.scanCard}>
+              <Image source={{ uri: scan.image }} style={styles.scanImage} />
+              
+              <View style={styles.scanInfo}>
+                <View style={styles.scanDetails}>
+                  {scan.licenseNumber && (
+                    <ThemedText style={styles.licenseNumber}>
+                      {scan.licenseNumber}
+                    </ThemedText>
+                  )}
+                  
+                  {scan.stateAbbreviation && (
+                    <View style={styles.stateBadge}>
+                      <ThemedText style={styles.stateText}>
+                        {scan.stateAbbreviation}
+                      </ThemedText>
+                    </View>
+                  )}
+                </View>
+                
+                <ThemedText style={styles.timestamp}>
+                  {formatDate(scan.timestamp)}
+                </ThemedText>
+              </View>
+            </ThemedView>
+          ))}
+        </ScrollView>
+      )}
     </ParallaxScrollView>
   );
 }
@@ -83,10 +114,24 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+    marginBottom: 16,
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
+  headerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  clearButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: '#FF3B30',
+    borderRadius: 6,
+  },
+  clearButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
   reactLogo: {
     height: 178,
@@ -94,5 +139,73 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     position: 'absolute',
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 60,
+    gap: 8,
+  },
+  emptyText: {
+    fontSize: 18,
+    fontWeight: '600',
+    opacity: 0.6,
+  },
+  emptySubtext: {
+    fontSize: 14,
+    opacity: 0.4,
+    textAlign: 'center',
+    paddingHorizontal: 40,
+  },
+  scanList: {
+    flex: 1,
+  },
+  scanCard: {
+    flexDirection: 'row',
+    backgroundColor: '#000',
+    borderRadius: 12,
+    marginBottom: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  scanImage: {
+    width: 120,
+    height: 90,
+    backgroundColor: '#1a1a1a',
+  },
+  scanInfo: {
+    flex: 1,
+    padding: 12,
+    justifyContent: 'space-between',
+  },
+  scanDetails: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  licenseNumber: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#FFD700',
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+  },
+  stateBadge: {
+    backgroundColor: '#007AFF',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  stateText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  timestamp: {
+    fontSize: 11,
+    opacity: 0.5,
+    marginTop: 4,
   },
 });

@@ -85,6 +85,24 @@ def is_license_plate_text(text, area=0):
     
     return True
 
+def clean_license_text(text):
+    """Remove unwanted characters from license plate text"""
+    if not text:
+        return text
+    
+    # Remove specific unwanted characters but keep hyphens
+    # Remove: +, *, /, \, |, and other common OCR noise
+    unwanted_chars = ['+', '*', '/', '\\', '|', '~', '`', '^', '<', '>', '{', '}', '[', ']', ';', ':', '"', "'", ',', '.', '!', '@', '#', '$', '%', '&', '(', ')']
+    
+    cleaned = text
+    for char in unwanted_chars:
+        cleaned = cleaned.replace(char, '')
+    
+    # Clean up multiple spaces
+    cleaned = ' '.join(cleaned.split())
+    
+    return cleaned.strip()
+
 def get_license_plate_candidates(results):
     """Find text regions that could be parts of a license plate"""
     candidates = []
@@ -105,7 +123,7 @@ def get_license_plate_candidates(results):
         # Check if this could be license plate text (pass area for filtering)
         if is_license_plate_text(text, area):
             candidates.append({
-                'text': text.strip().upper(),
+                'text': clean_license_text(text.strip().upper()),
                 'confidence': confidence,
                 'area': area,
                 'bbox': bbox,
@@ -217,7 +235,7 @@ def merge_adjacent_candidates(candidates, image_width):
         if len(group) <= 2:  # Only consider small groups
             texts = [c['text'] for c in sorted(group, key=lambda x: x['min_x'])]
             combined_text = ' '.join(texts)
-            clean_text = combined_text.replace(' ', '')
+            clean_text = clean_license_text(combined_text.replace(' ', ''))
             
             # Skip if it creates something too long
             if len(clean_text) > 8:
@@ -251,7 +269,7 @@ def apply_ocr_corrections(text, confidence=1.0):
     if not text:
         return text
     
-    corrected = text.upper()
+    corrected = clean_license_text(text.upper())
     
     # For low confidence, try more aggressive corrections
     if confidence < 0.8:
