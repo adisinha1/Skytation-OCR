@@ -26,6 +26,7 @@ export default function OCRScreen() {
   const [lastPhoto, setLastPhoto] = useState<string | null>(null);
   const [debugImages, setDebugImages] = useState<Array<{name: string, data: string}>>([]);
   const [currentDebugImageIndex, setCurrentDebugImageIndex] = useState(0);
+  const [captureSource, setCaptureSource] = useState<'phone' | 'drone'>('phone');
 
   const BACKEND_URL = 'http://10.0.0.67:5001';
 
@@ -42,6 +43,7 @@ export default function OCRScreen() {
       setIsProcessing(true);
       setClassification(null);
       setRawText('Focusing...');
+      setCaptureSource('phone');
 
       await new Promise(resolve => setTimeout(resolve, 500));
 
@@ -91,6 +93,58 @@ export default function OCRScreen() {
     }
   };
 
+  const handleCaptureDrone = async () => {
+    if (isProcessing) return;
+
+    try {
+      setIsProcessing(true);
+      setClassification(null);
+      setRawText('Capturing from drone...');
+      setCaptureSource('drone');
+      setLastPhoto(null);
+
+      const response = await fetch(`${BACKEND_URL}/capture-drone`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}), // Uses default stream URL from server
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        
+        // Set the captured image
+        if (data.captured_image) {
+          setLastPhoto(data.captured_image);
+        }
+        
+        setRawText(data.text || 'No text detected');
+        setConfidence(data.confidence || 0);
+        setClassification(data.classification || null);
+        setLastQuality(data.quality_status || `Frame: ${data.frame_width}x${data.frame_height}`);
+        setDebugImages(data.debug_images || []);
+        setCurrentDebugImageIndex(0);
+        setCaptureCount(c => c + 1);
+        
+        // Save scan if license plate was detected
+        if (data.classification?.license_number && data.captured_image) {
+          await saveScan({
+            licenseNumber: data.classification.license_number,
+            stateAbbreviation: data.classification.state_abbreviation,
+            image: data.captured_image,
+          });
+        }
+      } else {
+        const errorData = await response.json();
+        setRawText(`Drone capture error: ${errorData.error || 'Unknown error'}`);
+      }
+
+      setIsProcessing(false);
+    } catch (err) {
+      setRawText('Error: ' + String(err));
+      setIsProcessing(false);
+    }
+  };
+
   const handleCaptureNewPlate = () => {
     setLastPhoto(null);
     setRawText('');
@@ -113,6 +167,15 @@ export default function OCRScreen() {
     return (
       <View style={styles.container}>
         <Text style={styles.text}>Camera permission denied</Text>
+        <TouchableOpacity
+          style={[styles.button, styles.droneButton, { marginTop: 20 }]}
+          onPress={handleCaptureDrone}
+          disabled={isProcessing}
+        >
+          <Text style={styles.buttonText}>
+            {isProcessing ? 'Capturing...' : '🚁 Capture from Drone'}
+          </Text>
+        </TouchableOpacity>
       </View>
     );
   }
@@ -138,6 +201,7 @@ export default function OCRScreen() {
               <View style={styles.debugImageInfo}>
                 <Text style={styles.debugImageLabel}>
                   {debugImages[currentDebugImageIndex]?.name}
+                  {captureSource === 'drone' && ' (Drone)'}
                 </Text>
                 <Text style={styles.debugImageCounter}>
                   {currentDebugImageIndex + 1} of {debugImages.length}
@@ -247,15 +311,27 @@ export default function OCRScreen() {
       {/* Buttons */}
       <View style={styles.buttonContainer}>
         {!lastPhoto ? (
-          <TouchableOpacity
-            style={[styles.button, isProcessing && styles.buttonDisabled]}
-            onPress={handleTakePhoto}
-            disabled={isProcessing}
-          >
-            <Text style={styles.buttonText}>
-              {isProcessing ? 'Processing...' : '📸 Capture & Analyze'}
-            </Text>
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity
+              style={[styles.button, isProcessing && styles.buttonDisabled]}
+              onPress={handleTakePhoto}
+              disabled={isProcessing}
+            >
+              <Text style={styles.buttonText}>
+                {isProcessing && captureSource === 'phone' ? 'Processing...' : '📸 Capture & Analyze'}
+              </Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity
+              style={[styles.button, styles.droneButton, isProcessing && styles.buttonDisabled]}
+              onPress={handleCaptureDrone}
+              disabled={isProcessing}
+            >
+              <Text style={styles.buttonText}>
+                {isProcessing && captureSource === 'drone' ? 'Capturing...' : '🚁 Capture from Drone'}
+              </Text>
+            </TouchableOpacity>
+          </>
         ) : (
           <TouchableOpacity
             style={styles.button}
@@ -269,6 +345,9 @@ export default function OCRScreen() {
       {isProcessing && (
         <View style={styles.loadingOverlay}>
           <ActivityIndicator size="large" color="#FFF" />
+          <Text style={styles.loadingText}>
+            {captureSource === 'drone' ? 'Capturing from drone stream...' : 'Processing...'}
+          </Text>
         </View>
       )}
     </View>
@@ -283,6 +362,8 @@ const styles = StyleSheet.create({
   text: {
     color: '#FFF',
     fontSize: 18,
+    textAlign: 'center',
+    marginTop: 100,
   },
   camera: {
     flex: 0.5,
@@ -316,11 +397,6 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: 8,
     width: '85%',
-  },
-  guidanceText: {
-    color: '#AAA',
-    fontSize: 11,
-    marginVertical: 3,
   },
   debugSection: {
     flex: 0.5,
@@ -489,12 +565,16 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderTopWidth: 1,
     borderTopColor: '#333',
+    gap: 8,
   },
   button: {
     backgroundColor: '#007AFF',
     paddingVertical: 12,
     borderRadius: 8,
     alignItems: 'center',
+  },
+  droneButton: {
+    backgroundColor: '#FF6B00',
   },
   buttonDisabled: {
     backgroundColor: '#555',
@@ -509,5 +589,10 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.7)',
     justifyContent: 'center',
     alignItems: 'center',
+    gap: 12,
+  },
+  loadingText: {
+    color: '#FFF',
+    fontSize: 14,
   },
 });

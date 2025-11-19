@@ -6,6 +6,11 @@ export interface ScanRecord {
   licenseNumber: string | null;
   stateAbbreviation: string | null;
   image: string; // base64 image
+  gpsCoordinates?: {
+    latitude: number;
+    longitude: number;
+  } | null;
+  location?: string | null;
 }
 
 const STORAGE_KEY = '@scan_history';

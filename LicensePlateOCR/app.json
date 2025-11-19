@@ -42,6 +42,14 @@
         }
       ],
       [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location to tag scans.",
+          "locationWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location to tag scans."
+        }
+      ]
+      ,
+      [
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-icon.png",

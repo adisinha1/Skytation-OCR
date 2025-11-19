@@ -7,19 +7,22 @@ import ParallaxScrollView from '@/components/parallax-scroll-view';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { getScans, clearScans, ScanRecord } from '@/app/scanStorage';
+import { getZones, findZoneByCoordinates, CampusZone } from '@/app/campusZones';
 
 export default function HomeScreen() {
   const [scans, setScans] = useState<ScanRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [campusZones, setCampusZones] = useState<CampusZone[]>([]);
 
   const loadScans = async () => {
     setIsLoading(true);
     const scanHistory = await getScans();
+    const zones = await getZones();
     setScans(scanHistory);
+    setCampusZones(zones);
     setIsLoading(false);
   };
 
-  // Reload scans whenever the screen comes into focus
   useFocusEffect(
     useCallback(() => {
       loadScans();
@@ -31,14 +34,28 @@ export default function HomeScreen() {
     setScans([]);
   };
 
-  const formatDate = (timestamp: number) => {
+  const formatTime = (timestamp: number) => {
     const date = new Date(timestamp);
-    return date.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
+    return date.toLocaleTimeString('en-US', {
+      hour: 'numeric',
       minute: '2-digit',
+      hour12: true,
     });
+  };
+
+  const getCampusLocation = (gps: {latitude: number, longitude: number} | null | undefined) => {
+    if (!gps) return null;
+
+    const zone = findZoneByCoordinates(gps.latitude, gps.longitude, campusZones);
+    
+    if (zone) {
+      return {
+        name: zone.name,
+        zone: zone.code,
+      };
+    }
+
+    return null;
   };
 
   return (
@@ -76,33 +93,54 @@ export default function HomeScreen() {
         </ThemedView>
       ) : (
         <ScrollView style={styles.scanList}>
-          {scans.map((scan) => (
-            <ThemedView key={scan.id} style={styles.scanCard}>
-              <Image source={{ uri: scan.image }} style={styles.scanImage} />
-              
-              <View style={styles.scanInfo}>
-                <View style={styles.scanDetails}>
-                  {scan.licenseNumber && (
-                    <ThemedText style={styles.licenseNumber}>
-                      {scan.licenseNumber}
-                    </ThemedText>
-                  )}
-                  
-                  {scan.stateAbbreviation && (
-                    <View style={styles.stateBadge}>
-                      <ThemedText style={styles.stateText}>
-                        {scan.stateAbbreviation}
+          {scans.map((scan) => {
+            const campusLocation = getCampusLocation(scan.gpsCoordinates);
+            
+            return (
+              <ThemedView key={scan.id} style={styles.scanCard}>
+                <Image source={{ uri: scan.image }} style={styles.scanImage} />
+                
+                <View style={styles.scanInfo}>
+                  {/* Top Row: Plate, State, Time */}
+                  <View style={styles.scanDetails}>
+                    {scan.licenseNumber && (
+                      <ThemedText style={styles.licenseNumber}>
+                        {scan.licenseNumber}
+                      </ThemedText>
+                    )}
+                    
+                    {scan.stateAbbreviation && (
+                      <View style={styles.stateBadge}>
+                        <ThemedText style={styles.stateText}>
+                          {scan.stateAbbreviation}
+                        </ThemedText>
+                      </View>
+                    )}
+
+                    <View style={styles.timeBadge}>
+                      <ThemedText style={styles.timeText}>
+                        {formatTime(scan.timestamp)}
+                      </ThemedText>
+                    </View>
+                  </View>
+
+                  {/* Campus Location - Zone Code + Name on same line */}
+                  {campusLocation && (
+                    <View style={styles.locationRow}>
+                      <View style={styles.zoneBadge}>
+                        <ThemedText style={styles.zoneText}>
+                          {campusLocation.zone}
+                        </ThemedText>
+                      </View>
+                      <ThemedText style={styles.locationName}>
+                        📍 {campusLocation.name}
                       </ThemedText>
                     </View>
                   )}
                 </View>
-                
-                <ThemedText style={styles.timestamp}>
-                  {formatDate(scan.timestamp)}
-                </ThemedText>
-              </View>
-            </ThemedView>
-          ))}
+              </ThemedView>
+            );
+          })}
         </ScrollView>
       )}
     </ParallaxScrollView>
@@ -203,9 +241,39 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  timestamp: {
+  timeBadge: {
+    backgroundColor: '#4CAF50',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  timeText: {
+    color: '#FFF',
     fontSize: 11,
-    opacity: 0.5,
+    fontWeight: '600',
+  },
+  locationRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
     marginTop: 4,
+  },
+  zoneBadge: {
+    backgroundColor: '#FF6B35',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  zoneText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: 'bold',
+    letterSpacing: 1,
+  },
+  locationName: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#AAA',
+    flex: 1,
   },
 });

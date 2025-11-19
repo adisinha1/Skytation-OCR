@@ -9,15 +9,17 @@ app.use(cors());
 
 console.log('Starting License Plate OCR Backend...');
 
+// Configuration - Update this with your stream URL
+const STREAM_URL = process.env.STREAM_URL || 'rtsp://10.0.0.16:8554/camera';
+
+// Existing endpoint for phone camera
 app.post('/process-frame', (req, res) => {
-  // Get frame from phone camera (sent via request body)
   const { frame } = req.body;
 
   if (!frame) {
     return res.status(400).json({ error: 'No frame provided' });
   }
 
-  // Call Python processing script
   const python = spawn('python3', [path.join(__dirname, 'process_frame.py')]);
   let result = '';
   let error = '';
@@ -31,11 +33,9 @@ app.post('/process-frame', (req, res) => {
     console.error('Python error:', data.toString());
   });
 
-  // Send frame data to Python
   python.stdin.write(JSON.stringify({ frame }));
   python.stdin.end();
 
-  // Handle completion
   python.on('close', (code) => {
     if (code === 0 && result) {
       try {
@@ -60,6 +60,186 @@ app.post('/process-frame', (req, res) => {
   }, 60000);
 });
 
+// New endpoint: Capture frame from drone/RTSP stream and process it
+app.post('/capture-drone', async (req, res) => {
+  const streamUrl = req.body.streamUrl || STREAM_URL;
+  
+  console.log(`Capturing frame from stream: ${streamUrl}`);
+  
+  // Step 1: Capture frame from stream
+  const captureScript = `
+import cv2
+import base64
+import json
+import sys
+
+stream_url = "${streamUrl}"
+
+try:
+    # Use FFMPEG backend with optimized settings for RTSP
+    cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+    
+    if not cap.isOpened():
+        print(json.dumps({'success': False, 'error': 'Failed to open stream'}))
+        sys.exit(1)
+    
+    # Set buffer size to minimum for latest frame
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
+    # Try to set high resolution (may already be set by stream)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    
+    # Read multiple frames to flush buffer and get the latest one
+    frame = None
+    for _ in range(10):
+        ret, frame = cap.read()
+        if not ret:
+            break
+    
+    cap.release()
+    
+    if frame is None:
+        print(json.dumps({'success': False, 'error': 'Failed to capture frame'}))
+        sys.exit(1)
+    
+    # Encode with maximum quality
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 98])
+    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+    
+    print(json.dumps({
+        'success': True,
+        'frame': frame_base64,
+        'width': frame.shape[1],
+        'height': frame.shape[0]
+    }))
+    
+except Exception as e:
+    print(json.dumps({'success': False, 'error': str(e)}))
+    sys.exit(1)
+`;
+
+  const captureProcess = spawn('python3', ['-c', captureScript]);
+  let captureResult = '';
+  let captureError = '';
+
+  captureProcess.stdout.on('data', (data) => {
+    captureResult += data.toString();
+  });
+
+  captureProcess.stderr.on('data', (data) => {
+    captureError += data.toString();
+    console.error('Capture error:', data.toString());
+  });
+
+  captureProcess.on('close', (captureCode) => {
+    if (captureCode !== 0) {
+      console.error('Frame capture failed');
+      return res.status(500).json({ 
+        error: captureError || 'Frame capture failed', 
+        success: false 
+      });
+    }
+
+    let captureData;
+    try {
+      captureData = JSON.parse(captureResult);
+    } catch (e) {
+      console.error('Failed to parse capture result:', e);
+      return res.status(500).json({ 
+        error: 'Invalid capture response', 
+        success: false 
+      });
+    }
+
+    if (!captureData.success) {
+      return res.status(500).json({ 
+        error: captureData.error || 'Capture failed', 
+        success: false 
+      });
+    }
+
+    console.log(`Captured frame: ${captureData.width}x${captureData.height}`);
+
+    // Step 2: Process the captured frame with OCR
+    const ocrProcess = spawn('python3', [path.join(__dirname, 'process_frame.py')]);
+    let ocrResult = '';
+    let ocrError = '';
+
+    ocrProcess.stdout.on('data', (data) => {
+      ocrResult += data.toString();
+    });
+
+    ocrProcess.stderr.on('data', (data) => {
+      ocrError += data.toString();
+      console.error('OCR error:', data.toString());
+    });
+
+    ocrProcess.stdin.write(JSON.stringify({ frame: captureData.frame }));
+    ocrProcess.stdin.end();
+
+    ocrProcess.on('close', (ocrCode) => {
+      if (ocrCode === 0 && ocrResult) {
+        try {
+          const parsed = JSON.parse(ocrResult);
+          console.log('Drone OCR Result:', parsed.classification?.license_number || 'No plate detected');
+          
+          // Return combined result with captured image
+          res.json({
+            ...parsed,
+            captured_image: `data:image/jpg;base64,${captureData.frame}`,
+            stream_url: streamUrl,
+            frame_width: captureData.width,
+            frame_height: captureData.height
+          });
+        } catch (e) {
+          console.error('JSON parse error:', e);
+          res.status(500).json({ 
+            error: 'Invalid OCR response', 
+            success: false 
+          });
+        }
+      } else {
+        console.error('OCR process failed:', ocrCode);
+        res.status(500).json({ 
+          error: ocrError || 'OCR processing failed', 
+          success: false 
+        });
+      }
+    });
+
+    // Timeout for OCR processing
+    setTimeout(() => {
+      if (ocrProcess.exitCode === null) {
+        ocrProcess.kill();
+        res.status(500).json({ 
+          error: 'OCR processing timeout', 
+          success: false 
+        });
+      }
+    }, 60000);
+  });
+
+  // Timeout for frame capture
+  setTimeout(() => {
+    if (captureProcess.exitCode === null) {
+      captureProcess.kill();
+      res.status(500).json({ 
+        error: 'Frame capture timeout', 
+        success: false 
+      });
+    }
+  }, 30000);
+});
+
+// Get current stream configuration
+app.get('/stream-config', (req, res) => {
+  res.json({
+    streamUrl: STREAM_URL,
+    status: 'configured'
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -68,4 +248,5 @@ const PORT = process.env.PORT || 5001;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on http://0.0.0.0:${PORT}`);
   console.log(`📱 Connect your phone to: http://YOUR_COMPUTER_IP:${PORT}`);
+  console.log(`🎥 Stream URL configured: ${STREAM_URL}`);
 });

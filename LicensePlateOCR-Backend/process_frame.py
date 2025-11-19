@@ -265,69 +265,13 @@ def merge_adjacent_candidates(candidates, image_width):
     return best_result
 
 def apply_ocr_corrections(text, confidence=1.0):
-    """Apply common OCR correction patterns for license plates"""
+    """Apply minimal OCR correction - only clean special characters"""
     if not text:
         return text
     
-    corrected = clean_license_text(text.upper())
-    
-    # For low confidence, try more aggressive corrections
-    if confidence < 0.8:
-        parts = corrected.split()
-        
-        for part_idx, part in enumerate(parts):
-            # Determine if this part should be letters or numbers based on position and format
-            has_letters = any(c.isalpha() for c in part)
-            has_numbers = any(c.isdigit() for c in part)
-            
-            # Generate variations for each part
-            part_variations = [part]
-            
-            # If part is mostly letters (>50%), try letter corrections
-            if sum(c.isalpha() for c in part) >= len(part) / 2:
-                # Try converting ambiguous characters to letters
-                letter_version = part
-                for old, new in [('0', 'O'), ('1', 'I'), ('5', 'S'), ('8', 'B'), ('4', 'A'), ('6', 'G'), ('2', 'Z')]:
-                    letter_version = letter_version.replace(old, new)
-                if letter_version != part:
-                    part_variations.append(letter_version)
-            
-            # If part is mostly numbers (>50%), try number corrections
-            elif sum(c.isdigit() for c in part) >= len(part) / 2:
-                # Try converting ambiguous characters to numbers
-                number_version = part
-                for old, new in [('O', '0'), ('I', '1'), ('S', '5'), ('B', '8'), ('A', '4'), ('G', '6'), ('Z', '2')]:
-                    number_version = number_version.replace(old, new)
-                if number_version != part:
-                    part_variations.append(number_version)
-            
-            # For mixed content, try context-aware corrections
-            else:
-                # Common license plate patterns
-                mixed_version = part
-                
-                # If it's 3 characters and looks like it should be all letters (common prefix)
-                if len(part) == 3 and part_idx == 0:
-                    for old, new in [('0', 'O'), ('1', 'I'), ('5', 'S'), ('8', 'B'), ('4', 'A')]:
-                        mixed_version = mixed_version.replace(old, new)
-                    part_variations.append(mixed_version)
-                
-                # If it's 3-4 characters and looks like it should be all numbers (common suffix)
-                elif len(part) in [3, 4] and part_idx == len(parts) - 1:
-                    for old, new in [('O', '0'), ('I', '1'), ('S', '5'), ('B', '8'), ('A', '4')]:
-                        mixed_version = mixed_version.replace(old, new)
-                    part_variations.append(mixed_version)
-            
-            # Store best variation (prefer original if high confidence on that part)
-            if len(part_variations) > 1:
-                parts[part_idx] = part_variations[1]  # Use the corrected version
-        
-        corrected_text = ' '.join(parts)
-        if corrected_text != corrected:
-            print(f"OCR Correction: '{corrected}' -> '{corrected_text}'", file=sys.stderr)
-            return corrected_text
-    
-    return corrected
+    # Just clean the text, no character substitutions
+    # Trust the OCR result
+    return clean_license_text(text.upper())
 
 def validate_plate_format(text):
     """Check if the text matches common license plate formats"""
@@ -342,15 +286,11 @@ def validate_plate_format(text):
         r'^[A-Z]{3}\d{3,4}$',     # ABC 123 or ABC 1234
         r'^\d{3,4}[A-Z]{3}$',     # 123 ABC or 1234 ABC
         r'^[A-Z]{2}\d{4,5}$',     # AB 12345
-        r'^\d{1}[A-Z]{3}\d{3}$',  # 1ABC234 (California)
-        r'^[A-Z]\d{6,7}$',        # A 123456
         r'^[A-Z]{2,3}\d{2,4}[A-Z]?$',  # ABC 12, AB 1234, AB 123 A
         r'^\d{2,4}[A-Z]{2,3}$',   # 12 ABC, 1234 AB
-        r'^[A-Z]{4}\d{2}$',       # ABCD 12 (some specialty plates)
         r'^[A-Z0-9]{2,8}$',       # Generic alphanumeric 2-8 chars
     ]
     
-    import re
     for pattern in patterns:
         if re.match(pattern, clean):
             return True
@@ -395,6 +335,7 @@ def classify_results(results, full_text, image_width):
         'state': None,
         'state_abbreviation': None,
         'license_number': None,
+        'plate_confidence': None,
     }
     
     # Get license plate candidates
@@ -408,13 +349,13 @@ def classify_results(results, full_text, image_width):
         original_text = merged_result['text']
         corrected_text = apply_ocr_corrections(original_text, merged_result['confidence'])
         
+        # Store the plate confidence
+        classification['plate_confidence'] = merged_result['confidence']
+        
         # Validate the format
         if validate_plate_format(corrected_text):
             classification['license_number'] = corrected_text
-            if corrected_text != original_text:
-                print(f"CORRECTED LICENSE PLATE: '{original_text}' -> '{corrected_text}'", file=sys.stderr)
-            else:
-                print(f"SELECTED LICENSE PLATE: '{corrected_text}' (confidence: {merged_result['confidence']:.2f})", file=sys.stderr)
+            print(f"SELECTED LICENSE PLATE: '{corrected_text}' (confidence: {merged_result['confidence']:.2f})", file=sys.stderr)
         else:
             # Use original if correction fails validation
             classification['license_number'] = original_text
@@ -507,15 +448,17 @@ def process_license_plate(frame_base64):
         avg_confidence = np.mean(confidences)
         classification = classify_results(results, full_text, preprocessed_width)
         
-        quality_status = "Good quality" if avg_confidence > 0.7 else "Low confidence"
+        # Use plate confidence if available, otherwise fall back to average
+        plate_confidence = classification.get('plate_confidence') or avg_confidence
+        quality_status = "Good quality" if plate_confidence > 0.7 else "Low confidence"
         
         print(f"Full text: '{full_text}'", file=sys.stderr)
-        print(f"Average confidence: {avg_confidence:.2f}", file=sys.stderr)
+        print(f"Plate confidence: {plate_confidence:.2f}", file=sys.stderr)
         print(f"Classification: {classification}", file=sys.stderr)
         
         return {
             "text": full_text,
-            "confidence": float(avg_confidence),
+            "confidence": float(plate_confidence),
             "quality_status": quality_status,
             "classification": classification,
             "debug_images": debug_images,
