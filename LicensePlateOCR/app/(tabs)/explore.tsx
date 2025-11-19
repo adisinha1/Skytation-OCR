@@ -8,8 +8,8 @@ import {
   TextInput,
   Alert,
   Modal,
+  Platform,
 } from 'react-native';
-import MapView, { Marker, Circle, Region } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { useFocusEffect } from 'expo-router';
 import {
@@ -20,73 +20,223 @@ import {
   CampusZone,
 } from '@/app/campusZones';
 
+// Only import WebView on native platforms
+let WebView: any = null;
+if (Platform.OS !== 'web') {
+  WebView = require('react-native-webview').WebView;
+}
+
 export default function ZonesScreen() {
-  const mapRef = useRef<MapView>(null);
+  const webViewRef = useRef<any>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const [zones, setZones] = useState<CampusZone[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState<{
     latitude: number;
     longitude: number;
   } | null>(null);
+  const [mapKey, setMapKey] = useState(0); // For forcing map refresh
   
   // Form state
   const [zoneName, setZoneName] = useState('');
   const [zoneCode, setZoneCode] = useState('');
-
-  // Map region (centered on your campus - update these coordinates!)
-  const [mapRegion, setMapRegion] = useState<Region>({
-    latitude: 40.4259, // Purdue University approximate center
+  
+  // Map center (default: Purdue University area)
+  const [mapCenter, setMapCenter] = useState({
+    latitude: 40.4259,
     longitude: -86.9081,
-    latitudeDelta: 0.01, // Zoom level
-    longitudeDelta: 0.01,
   });
 
   const loadZones = async () => {
     const loadedZones = await getZones();
     setZones(loadedZones);
+    setMapKey(prev => prev + 1); // Refresh map when zones change
   };
+
+  useFocusEffect(
+    useCallback(() => {
+      loadZones();
+    }, [])
+  );
+
+  // Generate the Leaflet map HTML
+  const generateMapHTML = () => {
+    const markersJS = zones.map(zone => `
+      L.marker([${zone.latitude}, ${zone.longitude}])
+        .addTo(map)
+        .bindPopup('<b>${zone.name}</b><br>${zone.code}');
+      L.circle([${zone.latitude}, ${zone.longitude}], {
+        color: '#007AFF',
+        fillColor: '#007AFF',
+        fillOpacity: 0.2,
+        radius: 50
+      }).addTo(map);
+    `).join('\n');
+
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <style>
+          * { margin: 0; padding: 0; }
+          html, body, #map { height: 100%; width: 100%; }
+        </style>
+      </head>
+      <body>
+        <div id="map"></div>
+        <script>
+          var map = L.map('map').setView([${mapCenter.latitude}, ${mapCenter.longitude}], 16);
+          
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+          }).addTo(map);
+          
+          // Add existing zone markers
+          ${markersJS}
+          
+          // Handle map clicks
+          map.on('click', function(e) {
+            var message = JSON.stringify({
+              type: 'mapClick',
+              latitude: e.latlng.lat,
+              longitude: e.latlng.lng
+            });
+            
+            // For React Native WebView
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(message);
+            }
+            // For web iframe
+            else if (window.parent !== window) {
+              window.parent.postMessage(message, '*');
+            }
+          });
+          
+          // Function to center map
+          function centerMap(lat, lng) {
+            map.setView([lat, lng], 16);
+          }
+          
+          // Function to add temporary marker for selection
+          var tempMarker = null;
+          function showTempMarker(lat, lng) {
+            if (tempMarker) {
+              map.removeLayer(tempMarker);
+            }
+            tempMarker = L.marker([lat, lng], {
+              icon: L.divIcon({
+                className: 'temp-marker',
+                html: '<div style="background: #FF3B30; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white;"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+              })
+            }).addTo(map);
+          }
+          
+          // Listen for messages from parent (for web)
+          window.addEventListener('message', function(event) {
+            try {
+              var data = JSON.parse(event.data);
+              if (data.type === 'centerMap') {
+                centerMap(data.latitude, data.longitude);
+              } else if (data.type === 'showTempMarker') {
+                showTempMarker(data.latitude, data.longitude);
+              }
+            } catch (e) {}
+          });
+        </script>
+      </body>
+      </html>
+    `;
+  };
+
+  // Handle messages from map (both WebView and iframe)
+  const handleMapMessage = (data: any) => {
+    if (data.type === 'mapClick') {
+      setSelectedLocation({
+        latitude: data.latitude,
+        longitude: data.longitude,
+      });
+      setShowAddModal(true);
+      
+      // Show temporary marker
+      if (Platform.OS === 'web') {
+        iframeRef.current?.contentWindow?.postMessage(
+          JSON.stringify({ type: 'showTempMarker', latitude: data.latitude, longitude: data.longitude }),
+          '*'
+        );
+      } else {
+        webViewRef.current?.injectJavaScript(`
+          showTempMarker(${data.latitude}, ${data.longitude});
+          true;
+        `);
+      }
+    }
+  };
+
+  const handleWebViewMessage = (event: any) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      handleMapMessage(data);
+    } catch (e) {
+      console.error('Error parsing WebView message:', e);
+    }
+  };
+
+  // Set up web message listener
+  React.useEffect(() => {
+    if (Platform.OS === 'web') {
+      const handleMessage = (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          handleMapMessage(data);
+        } catch (e) {}
+      };
+      
+      window.addEventListener('message', handleMessage);
+      return () => window.removeEventListener('message', handleMessage);
+    }
+  }, []);
 
   const centerOnCurrentLocation = async () => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Location permission is required');
+        Alert.alert('Permission denied', 'Location permission is required');
         return;
       }
 
-      const location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
-      });
-
-      const newRegion = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      };
-
-      setMapRegion(newRegion);
-      mapRef.current?.animateToRegion(newRegion, 1000);
+      const location = await Location.getCurrentPositionAsync({});
+      const { latitude, longitude } = location.coords;
+      
+      setMapCenter({ latitude, longitude });
+      
+      // Center the map
+      if (Platform.OS === 'web') {
+        iframeRef.current?.contentWindow?.postMessage(
+          JSON.stringify({ type: 'centerMap', latitude, longitude }),
+          '*'
+        );
+      } else {
+        webViewRef.current?.injectJavaScript(`
+          centerMap(${latitude}, ${longitude});
+          true;
+        `);
+      }
     } catch (error) {
-      Alert.alert('Error', 'Could not get current location');
+      Alert.alert('Error', 'Failed to get current location');
     }
   };
 
-  const handleMapPress = (event: any) => {
-    const { latitude, longitude } = event.nativeEvent.coordinate;
-    setSelectedLocation({ latitude, longitude });
-    setShowAddModal(true);
-  };
+  const handleAddZone = async () => {
+    if (!zoneName.trim() || !zoneCode.trim()) {
+      Alert.alert('Error', 'Please fill in all fields');
+      return;
+    }
 
-  const handleSaveZone = async () => {
-    if (!zoneName.trim()) {
-      Alert.alert('Error', 'Please enter a zone name');
-      return;
-    }
-    if (!zoneCode.trim()) {
-      Alert.alert('Error', 'Please enter a zone code');
-      return;
-    }
     if (!selectedLocation) {
       Alert.alert('Error', 'Please select a location on the map');
       return;
@@ -94,35 +244,30 @@ export default function ZonesScreen() {
 
     await saveZone({
       name: zoneName,
-      code: zoneCode.toUpperCase(),
+      code: zoneCode,
       latitude: selectedLocation.latitude,
       longitude: selectedLocation.longitude,
       radius: 0.0005,
     });
 
-    // Reset form
     setZoneName('');
     setZoneCode('');
     setSelectedLocation(null);
     setShowAddModal(false);
-    
-    // Reload zones
     await loadZones();
-    
-    Alert.alert('Success', 'Zone saved successfully!');
   };
 
-  const handleDeleteZone = (zone: CampusZone) => {
+  const handleDeleteZone = async (id: string) => {
     Alert.alert(
       'Delete Zone',
-      `Are you sure you want to delete ${zone.name}?`,
+      'Are you sure you want to delete this zone?',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
           onPress: async () => {
-            await deleteZone(zone.id);
+            await deleteZone(id);
             await loadZones();
           },
         },
@@ -130,7 +275,7 @@ export default function ZonesScreen() {
     );
   };
 
-  const handleClearAll = () => {
+  const handleClearAll = async () => {
     Alert.alert(
       'Clear All Zones',
       'Are you sure you want to delete all zones?',
@@ -148,98 +293,64 @@ export default function ZonesScreen() {
     );
   };
 
-  const focusOnZone = (zone: CampusZone) => {
-    const region = {
-      latitude: zone.latitude,
-      longitude: zone.longitude,
-      latitudeDelta: 0.005,
-      longitudeDelta: 0.005,
-    };
-    mapRef.current?.animateToRegion(region, 1000);
+  // Render map based on platform
+  const renderMap = () => {
+    if (Platform.OS === 'web') {
+      return (
+        <iframe
+          ref={iframeRef}
+          key={mapKey}
+          srcDoc={generateMapHTML()}
+          style={{
+            width: '100%',
+            height: '100%',
+            border: 'none',
+          }}
+        />
+      );
+    } else {
+      return (
+        <WebView
+          ref={webViewRef}
+          key={mapKey}
+          source={{ html: generateMapHTML() }}
+          style={styles.map}
+          onMessage={handleWebViewMessage}
+          javaScriptEnabled={true}
+          domStorageEnabled={true}
+          startInLoadingState={true}
+          scalesPageToFit={true}
+        />
+      );
+    }
   };
-
-  useFocusEffect(
-    useCallback(() => {
-      loadZones();
-    }, [])
-  );
 
   return (
     <View style={styles.container}>
-      {/* Map View */}
+      {/* Map */}
       <View style={styles.mapContainer}>
-        <MapView
-          ref={mapRef}
-          style={styles.map}
-          initialRegion={mapRegion}
-          onPress={handleMapPress}
-          showsUserLocation
-          showsMyLocationButton
-        >
-          {/* Existing zones */}
-          {zones.map((zone) => (
-            <React.Fragment key={zone.id}>
-              <Marker
-                coordinate={{
-                  latitude: zone.latitude,
-                  longitude: zone.longitude,
-                }}
-                title={zone.code}
-                description={zone.name}
-                pinColor="#FF6B35"
-              />
-              <Circle
-                center={{
-                  latitude: zone.latitude,
-                  longitude: zone.longitude,
-                }}
-                radius={50} // 50 meters
-                strokeColor="rgba(255, 107, 53, 0.5)"
-                fillColor="rgba(255, 107, 53, 0.1)"
-              />
-            </React.Fragment>
-          ))}
-
-          {/* Selected location (preview) */}
-          {selectedLocation && (
-            <>
-              <Marker
-                coordinate={selectedLocation}
-                pinColor="#00FF00"
-                title="New Zone"
-              />
-              <Circle
-                center={selectedLocation}
-                radius={50}
-                strokeColor="rgba(0, 255, 0, 0.5)"
-                fillColor="rgba(0, 255, 0, 0.1)"
-              />
-            </>
-          )}
-        </MapView>
-
-        {/* Map Controls */}
+        {renderMap()}
+        
+        {/* Map Controls Overlay */}
         <View style={styles.mapControls}>
           <TouchableOpacity
-            style={styles.controlButton}
+            style={styles.locationButton}
             onPress={centerOnCurrentLocation}
           >
-            <Text style={styles.controlButtonText}>📍 My Location</Text>
+            <Text style={styles.buttonIcon}>📍</Text>
           </TouchableOpacity>
         </View>
-
-        {/* Instructions */}
-        <View style={styles.instructions}>
-          <Text style={styles.instructionsText}>
-            Tap anywhere on the map to add a new parking zone
-          </Text>
+        
+        {/* Instructions Overlay */}
+        <View style={styles.instructionsOverlay}>
+          <Text style={styles.instructionsText}>Tap on map to add a zone</Text>
         </View>
       </View>
 
-      {/* Zones List */}
-      <View style={styles.zonesListContainer}>
-        <View style={styles.zonesHeader}>
-          <Text style={styles.zonesTitle}>Saved Zones ({zones.length})</Text>
+      {/* Zone List */}
+      <View style={styles.zoneListContainer}>
+        <View style={styles.zoneListHeader}>
+          <Text style={styles.zoneListTitle}>Zones ({zones.length})</Text>
           {zones.length > 0 && (
             <TouchableOpacity
               style={styles.clearAllButton}
@@ -250,36 +361,31 @@ export default function ZonesScreen() {
           )}
         </View>
 
-        <ScrollView style={styles.zonesList} horizontal>
+        <ScrollView 
+          style={styles.zoneList}
+          showsVerticalScrollIndicator={true}
+        >
           {zones.length === 0 ? (
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>No zones yet</Text>
-            </View>
+            <Text style={styles.emptyText}>
+              No zones configured. Tap on the map to add one.
+            </Text>
           ) : (
             zones.map((zone) => (
-              <TouchableOpacity
-                key={zone.id}
-                style={styles.zoneCard}
-                onPress={() => focusOnZone(zone)}
-              >
-                <View style={styles.zoneCardHeader}>
-                  <View style={styles.zoneCodeBadge}>
-                    <Text style={styles.zoneCodeText}>{zone.code}</Text>
-                  </View>
-                  <TouchableOpacity
-                    style={styles.deleteIconButton}
-                    onPress={() => handleDeleteZone(zone)}
-                  >
-                    <Text style={styles.deleteIcon}>×</Text>
-                  </TouchableOpacity>
+              <View key={zone.id} style={styles.zoneCard}>
+                <View style={styles.zoneInfo}>
+                  <Text style={styles.zoneName}>{zone.name}</Text>
+                  <Text style={styles.zoneCode}>{zone.code}</Text>
+                  <Text style={styles.zoneCoords}>
+                    {zone.latitude.toFixed(5)}, {zone.longitude.toFixed(5)}
+                  </Text>
                 </View>
-                <Text style={styles.zoneCardName} numberOfLines={2}>
-                  {zone.name}
-                </Text>
-                <Text style={styles.zoneCardCoords}>
-                  {zone.latitude.toFixed(4)}, {zone.longitude.toFixed(4)}
-                </Text>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.deleteButton}
+                  onPress={() => handleDeleteZone(zone.id)}
+                >
+                  <Text style={styles.deleteButtonText}>×</Text>
+                </TouchableOpacity>
+              </View>
             ))
           )}
         </ScrollView>
@@ -288,29 +394,22 @@ export default function ZonesScreen() {
       {/* Add Zone Modal */}
       <Modal
         visible={showAddModal}
-        animationType="slide"
         transparent={true}
-        onRequestClose={() => setShowAddModal(false)}
+        animationType="slide"
+        onRequestClose={() => {
+          setShowAddModal(false);
+          setSelectedLocation(null);
+        }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Add New Zone</Text>
 
-            {selectedLocation && (
-              <View style={styles.locationPreview}>
-                <Text style={styles.locationLabel}>Selected Location:</Text>
-                <Text style={styles.coordinates}>
-                  {selectedLocation.latitude.toFixed(6)},{' '}
-                  {selectedLocation.longitude.toFixed(6)}
-                </Text>
-              </View>
-            )}
-
             <View style={styles.inputGroup}>
-              <Text style={styles.label}>Zone Name</Text>
+              <Text style={styles.inputLabel}>Zone Name</Text>
               <TextInput
                 style={styles.input}
-                placeholder="e.g., Parking Lot A - North"
+                placeholder="e.g., Parking Lot A"
                 placeholderTextColor="#666"
                 value={zoneName}
                 onChangeText={setZoneName}
@@ -318,36 +417,42 @@ export default function ZonesScreen() {
             </View>
 
             <View style={styles.inputGroup}>
-              <Text style={styles.label}>Zone Code</Text>
+              <Text style={styles.inputLabel}>Zone Code</Text>
               <TextInput
                 style={styles.input}
                 placeholder="e.g., A1"
                 placeholderTextColor="#666"
                 value={zoneCode}
                 onChangeText={setZoneCode}
-                maxLength={4}
-                autoCapitalize="characters"
               />
             </View>
 
+            {selectedLocation && (
+              <View style={styles.coordsDisplay}>
+                <Text style={styles.coordsLabel}>Location</Text>
+                <Text style={styles.coordsValue}>
+                  {selectedLocation.latitude.toFixed(6)}, {selectedLocation.longitude.toFixed(6)}
+                </Text>
+              </View>
+            )}
+
             <View style={styles.modalButtons}>
               <TouchableOpacity
-                style={[styles.button, styles.cancelButton]}
+                style={styles.addButton}
+                onPress={handleAddZone}
+              >
+                <Text style={styles.buttonText}>Add Zone</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.cancelButton}
                 onPress={() => {
                   setShowAddModal(false);
-                  setSelectedLocation(null);
                   setZoneName('');
                   setZoneCode('');
+                  setSelectedLocation(null);
                 }}
               >
                 <Text style={styles.buttonText}>Cancel</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.button, styles.saveButton]}
-                onPress={handleSaveZone}
-              >
-                <Text style={styles.buttonText}>💾 Save Zone</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -371,124 +476,120 @@ const styles = StyleSheet.create({
   },
   mapControls: {
     position: 'absolute',
-    top: 60,
-    right: 16,
-    gap: 8,
+    top: Platform.OS === 'web' ? 10 : 50,
+    right: 10,
   },
-  controlButton: {
+  locationButton: {
     backgroundColor: '#007AFF',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 8,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
     elevation: 5,
   },
-  controlButtonText: {
-    color: '#FFF',
-    fontSize: 14,
-    fontWeight: '600',
+  buttonIcon: {
+    fontSize: 20,
   },
-  instructions: {
+  instructionsOverlay: {
     position: 'absolute',
-    bottom: 16,
-    left: 16,
-    right: 16,
-    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-    padding: 12,
+    bottom: 10,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    padding: 10,
     borderRadius: 8,
+    alignItems: 'center',
   },
   instructionsText: {
     color: '#FFF',
-    fontSize: 13,
-    textAlign: 'center',
+    fontSize: 14,
   },
-  zonesListContainer: {
-    height: 140,
+  zoneListContainer: {
+    maxHeight: 250,
     backgroundColor: '#1a1a1a',
     borderTopWidth: 1,
     borderTopColor: '#333',
   },
-  zonesHeader: {
+  zoneListHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     padding: 12,
-    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#333',
   },
-  zonesTitle: {
+  zoneListTitle: {
+    color: '#FFF',
     fontSize: 16,
     fontWeight: 'bold',
-    color: '#FFF',
   },
   clearAllButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
     backgroundColor: '#FF3B30',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     borderRadius: 6,
   },
   clearAllButtonText: {
     color: '#FFF',
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '600',
   },
-  zonesList: {
-    paddingHorizontal: 12,
-  },
-  emptyState: {
-    padding: 20,
-    alignItems: 'center',
-  },
-  emptyText: {
-    fontSize: 14,
-    color: '#666',
+  zoneList: {
+    padding: 12,
   },
   zoneCard: {
-    backgroundColor: '#000',
-    borderRadius: 8,
-    padding: 12,
-    marginRight: 12,
-    width: 160,
-    borderWidth: 1,
-    borderColor: '#333',
-  },
-  zoneCardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    backgroundColor: '#000',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333',
     marginBottom: 8,
   },
-  zoneCodeBadge: {
-    backgroundColor: '#FF6B35',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
+  zoneInfo: {
+    flex: 1,
   },
-  zoneCodeText: {
+  zoneName: {
     color: '#FFF',
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: 'bold',
   },
-  deleteIconButton: {
-    padding: 4,
-  },
-  deleteIcon: {
-    color: '#FF3B30',
-    fontSize: 24,
-    fontWeight: 'bold',
-  },
-  zoneCardName: {
+  zoneCode: {
+    color: '#007AFF',
     fontSize: 12,
     fontWeight: '600',
-    color: '#FFF',
-    marginBottom: 4,
+    marginTop: 2,
   },
-  zoneCardCoords: {
-    fontSize: 10,
+  zoneCoords: {
     color: '#666',
-    fontFamily: 'monospace',
+    fontSize: 10,
+    marginTop: 4,
+  },
+  deleteButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#FF3B3020',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  deleteButtonText: {
+    color: '#FF3B30',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  emptyText: {
+    color: '#666',
+    fontSize: 14,
+    textAlign: 'center',
+    paddingVertical: 20,
   },
   modalOverlay: {
     flex: 1,
@@ -507,39 +608,20 @@ const styles = StyleSheet.create({
     borderColor: '#333',
   },
   modalTitle: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: 'bold',
     color: '#FFF',
     marginBottom: 20,
     textAlign: 'center',
   },
-  locationPreview: {
-    backgroundColor: '#000',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 16,
-    borderLeftWidth: 3,
-    borderLeftColor: '#00FF00',
-  },
-  locationLabel: {
-    color: '#888',
-    fontSize: 11,
-    marginBottom: 4,
-  },
-  coordinates: {
-    color: '#00FF00',
-    fontSize: 13,
-    fontFamily: 'monospace',
-  },
   inputGroup: {
     marginBottom: 16,
   },
-  label: {
-    fontSize: 12,
+  inputLabel: {
     color: '#888',
-    marginBottom: 8,
-    textTransform: 'uppercase',
+    fontSize: 12,
     fontWeight: '600',
+    marginBottom: 6,
   },
   input: {
     backgroundColor: '#000',
@@ -548,28 +630,43 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 12,
     color: '#FFF',
-    fontSize: 16,
+    fontSize: 14,
+  },
+  coordsDisplay: {
+    backgroundColor: '#000',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  coordsLabel: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  coordsValue: {
+    color: '#4CAF50',
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   modalButtons: {
-    flexDirection: 'row',
     gap: 12,
-    marginTop: 8,
   },
-  button: {
-    flex: 1,
+  addButton: {
+    backgroundColor: '#4CAF50',
     padding: 14,
     borderRadius: 8,
     alignItems: 'center',
   },
   cancelButton: {
     backgroundColor: '#333',
-  },
-  saveButton: {
-    backgroundColor: '#4CAF50',
+    padding: 14,
+    borderRadius: 8,
+    alignItems: 'center',
   },
   buttonText: {
     color: '#FFF',
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
   },
 });

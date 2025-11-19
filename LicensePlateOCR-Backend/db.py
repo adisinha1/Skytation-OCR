@@ -32,6 +32,8 @@ class Event(Base):
     result     = Column(String(16), nullable=False, default="unknown")  # "approved" | "violation" | "unknown"
     notes      = Column(Text, nullable=True)
     source     = Column(String(16), nullable=True)  # "phone" | "drone" | "manual"
+    time_limit_minutes = Column(Integer, nullable=True)  # Time limit for timed zones
+    lot_name   = Column(String(64), nullable=True)  # Lot name for permit or timed zones
 
 # --- Permits: simple allowlist of plates ---
 class Permit(Base):
@@ -51,6 +53,8 @@ class TimedStay(Base):
     plate_text = Column(String(32), index=True, nullable=False)
     first_seen = Column(DateTime(timezone=True), default=aware_now, nullable=False)
     last_seen  = Column(DateTime(timezone=True), default=aware_now, onupdate=aware_now, nullable=False)
+    time_limit_minutes = Column(Integer, default=120, nullable=False)  # Default 2 hours for Purdue
+    lot_name   = Column(String(64), nullable=True)  # Permit lot name
 
 # --- Violations are stored separately for reporting ---
 class Violation(Base):

@@ -1,7 +1,0 @@
-names:
-  0: license_plate
-nc: 1
-path: /Users/adisinha/Documents/GitHub/Skytation-OCR/LicensePlateCropping/data
-test: test/images
-train: train/images
-val: val/images

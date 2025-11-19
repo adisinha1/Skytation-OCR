@@ -6,15 +6,10 @@
 echo "🚀 Starting Unified Skytation Backend..."
 echo ""
 
-# Check if Python virtual environment exists
-if [ ! -d "venv" ]; then
-    echo "📦 Creating Python virtual environment..."
-    python3 -m venv venv
-fi
 
 # Activate virtual environment
 echo "🔧 Activating Python virtual environment..."
-source venv/bin/activate
+source ~/ocr-env/bin/activate
 
 # Install Python dependencies
 echo "📦 Installing Python dependencies..."

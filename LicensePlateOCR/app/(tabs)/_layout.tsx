@@ -34,7 +34,7 @@ export default function TabLayout() {
       <Tabs.Screen
         name="ocr"
         options={{
-          title: 'License Plate OCR',
+          title: 'OCR',
           tabBarIcon: ({ color }) => <Ionicons name="camera" size={28} color={color} />,
         }}
       />
