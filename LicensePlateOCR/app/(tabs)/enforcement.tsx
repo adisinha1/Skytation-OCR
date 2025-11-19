@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   TextInput,
   Alert,
   RefreshControl,
+  Modal,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 
@@ -16,16 +17,19 @@ const BACKEND_URL = 'http://10.0.0.67:8000'; // Update with your computer's IP
 interface Event {
   id: number;
   plate_text: string;
+  state?: string;
   confidence: number;
   timestamp: string;
   location: string;
   result: string;
   notes?: string;
+  source?: string;
 }
 
 interface Permit {
   id: number;
   plate_text: string;
+  state?: string;
   permit_type: string;
   notes?: string;
 }
@@ -51,12 +55,11 @@ export default function EnforcementScreen() {
   const [timedStays, setTimedStays] = useState<TimedStay[]>([]);
   const [violations, setViolations] = useState<Violation[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [showAllEvents, setShowAllEvents] = useState(false);
   
-  // Form state
-  const [plateInput, setPlateInput] = useState('');
-  const [confidenceInput, setConfidenceInput] = useState('0.99');
-  const [selectedLocation, setSelectedLocation] = useState<'permit' | 'timed'>('permit');
-  const [newPermitPlate, setNewPermitPlate] = useState('');
+  // Edit modal state
+  const [editingEvent, setEditingEvent] = useState<Event | null>(null);
+  const [showEditModal, setShowEditModal] = useState(false);
 
   const loadData = async () => {
     try {
@@ -88,104 +91,38 @@ export default function EnforcementScreen() {
     }, [])
   );
 
-  const submitOCREvent = async () => {
-    if (!plateInput.trim()) {
-      Alert.alert('Error', 'Please enter a plate number');
-      return;
-    }
-
-    try {
-      const response = await fetch(`${BACKEND_URL}/api/ocr_event`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          plate_text: plateInput.toUpperCase(),
-          confidence: parseFloat(confidenceInput),
-          timestamp: new Date().toISOString(),
-          location: selectedLocation,
-        }),
-      });
-
-      const result = await response.json();
-      
-      if (result.result === 'approved') {
-        Alert.alert('✅ Approved', result.message);
-      } else {
-        Alert.alert('⛔ Violation', result.message);
-      }
-
-      await loadData();
-      setPlateInput('');
-    } catch (error) {
-      Alert.alert('Error', 'Failed to submit event: ' + String(error));
-    }
-  };
-
-  const addPermit = async () => {
-    if (!newPermitPlate.trim()) {
-      Alert.alert('Error', 'Please enter a plate number');
-      return;
-    }
-
-    try {
-      const response = await fetch(`${BACKEND_URL}/api/permits`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          plate_text: newPermitPlate.toUpperCase(),
-          permit_type: 'A',
-        }),
-      });
-
-      if (response.ok) {
-        Alert.alert('Success', 'Permit added');
-        setNewPermitPlate('');
-        await loadData();
-      } else {
-        const error = await response.json();
-        Alert.alert('Error', error.detail || 'Failed to add permit');
-      }
-    } catch (error) {
-      Alert.alert('Error', 'Failed to add permit: ' + String(error));
-    }
-  };
-
-  const seedPermits = async () => {
-    try {
-      await fetch(`${BACKEND_URL}/api/permits/seed`, { method: 'POST' });
-      Alert.alert('Success', 'Sample permits seeded');
-      await loadData();
-    } catch (error) {
-      Alert.alert('Error', 'Failed to seed permits');
-    }
-  };
-
-  const resetTimed = async () => {
-    Alert.alert(
-      'Reset Timed Stays',
-      'Are you sure you want to reset all timed parking stays?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Reset',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await fetch(`${BACKEND_URL}/api/timed/reset`, { method: 'POST' });
-              Alert.alert('Success', 'Timed stays reset');
-              await loadData();
-            } catch (error) {
-              Alert.alert('Error', 'Failed to reset timed stays');
-            }
-          },
-        },
-      ]
-    );
-  };
+  // Update timer every second for countdown
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Force re-render to update countdown timers
+      setTimedStays(stays => [...stays]);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   const formatTimestamp = (timestamp: string) => {
     try {
-      return new Date(timestamp).toLocaleString();
+      const date = new Date(timestamp);
+      return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      });
+    } catch {
+      return timestamp;
+    }
+  };
+
+  const formatTime = (timestamp: string) => {
+    try {
+      const date = new Date(timestamp);
+      return date.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      });
     } catch {
       return timestamp;
     }
@@ -195,8 +132,33 @@ export default function EnforcementScreen() {
     const start = new Date(firstSeen);
     const now = new Date();
     const diffMin = (now.getTime() - start.getTime()) / 1000 / 60;
-    return diffMin.toFixed(1);
+    return diffMin;
   };
+
+  const formatDwellTime = (minutes: number) => {
+    if (minutes < 1) {
+      return `${Math.floor(minutes * 60)}s`;
+    } else if (minutes < 60) {
+      return `${Math.floor(minutes)}m`;
+    } else {
+      const hours = Math.floor(minutes / 60);
+      const mins = Math.floor(minutes % 60);
+      return `${hours}h ${mins}m`;
+    }
+  };
+
+  const calculateTimeRemaining = (firstSeen: string, limitMinutes: number = 2) => {
+    const dwell = calculateDwell(firstSeen);
+    const remaining = limitMinutes - dwell;
+    return remaining;
+  };
+
+  const handleEventClick = (event: Event) => {
+    setEditingEvent(event);
+    setShowEditModal(true);
+  };
+
+  const displayedEvents = showAllEvents ? events : events.slice(0, 5);
 
   return (
     <ScrollView
@@ -207,157 +169,216 @@ export default function EnforcementScreen() {
     >
       <View style={styles.header}>
         <Text style={styles.title}>Parking Enforcement</Text>
-        <Text style={styles.subtitle}>Submit OCR events and manage permits</Text>
+        <Text style={styles.subtitle}>Monitor violations and active parking</Text>
       </View>
 
-      {/* Submit OCR Event */}
+      {/* Section 1: Recent Events */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Submit OCR Event</Text>
-        
-        <TextInput
-          style={styles.input}
-          placeholder="Plate Number (e.g., ABC123)"
-          placeholderTextColor="#666"
-          value={plateInput}
-          onChangeText={setPlateInput}
-          autoCapitalize="characters"
-        />
-
-        <TextInput
-          style={styles.input}
-          placeholder="Confidence (0.0 - 1.0)"
-          placeholderTextColor="#666"
-          value={confidenceInput}
-          onChangeText={setConfidenceInput}
-          keyboardType="decimal-pad"
-        />
-
-        <View style={styles.radioGroup}>
-          <Text style={styles.label}>Location:</Text>
-          <View style={styles.radioButtons}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.cardTitle}>Recent Events ({events.length})</Text>
+          {events.length > 5 && (
             <TouchableOpacity
-              style={[styles.radioButton, selectedLocation === 'permit' && styles.radioButtonActive]}
-              onPress={() => setSelectedLocation('permit')}
+              style={styles.expandButton}
+              onPress={() => setShowAllEvents(!showAllEvents)}
             >
-              <Text style={[styles.radioText, selectedLocation === 'permit' && styles.radioTextActive]}>
-                Permit Zone
+              <Text style={styles.expandButtonText}>
+                {showAllEvents ? '▲ Show Less' : `▼ Show All (${events.length})`}
               </Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.radioButton, selectedLocation === 'timed' && styles.radioButtonActive]}
-              onPress={() => setSelectedLocation('timed')}
-            >
-              <Text style={[styles.radioText, selectedLocation === 'timed' && styles.radioTextActive]}>
-                Timed Zone
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        <TouchableOpacity style={styles.primaryButton} onPress={submitOCREvent}>
-          <Text style={styles.buttonText}>Submit Event</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Manage Permits */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Manage Permits ({permits.length})</Text>
-        
-        <View style={styles.inputRow}>
-          <TextInput
-            style={[styles.input, { flex: 1 }]}
-            placeholder="New Permit Plate"
-            placeholderTextColor="#666"
-            value={newPermitPlate}
-            onChangeText={setNewPermitPlate}
-            autoCapitalize="characters"
-          />
-          <TouchableOpacity style={styles.addButton} onPress={addPermit}>
-            <Text style={styles.buttonText}>Add</Text>
-          </TouchableOpacity>
-        </View>
-
-        <TouchableOpacity style={styles.secondaryButton} onPress={seedPermits}>
-          <Text style={styles.buttonText}>Seed Sample Permits</Text>
-        </TouchableOpacity>
-
-        <ScrollView style={styles.listContainer} horizontal>
-          {permits.map((permit) => (
-            <View key={permit.id} style={styles.permitCard}>
-              <Text style={styles.permitPlate}>{permit.plate_text}</Text>
-              <Text style={styles.permitType}>Type: {permit.permit_type}</Text>
-            </View>
-          ))}
-          {permits.length === 0 && (
-            <Text style={styles.emptyText}>No permits yet</Text>
           )}
-        </ScrollView>
-      </View>
-
-      {/* Timed Stays */}
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.cardTitle}>Timed Stays ({timedStays.length})</Text>
-          <TouchableOpacity style={styles.resetButton} onPress={resetTimed}>
-            <Text style={styles.resetButtonText}>Reset All</Text>
-          </TouchableOpacity>
         </View>
 
-        {timedStays.map((stay) => (
-          <View key={stay.id} style={styles.stayCard}>
-            <Text style={styles.stayPlate}>{stay.plate_text}</Text>
-            <Text style={styles.stayTime}>Dwell: {calculateDwell(stay.first_seen)} min</Text>
-            <Text style={styles.stayTimestamp}>{formatTimestamp(stay.first_seen)}</Text>
+        {displayedEvents.length === 0 ? (
+          <Text style={styles.emptyText}>No events yet</Text>
+        ) : (
+          <View style={styles.eventsList}>
+            {displayedEvents.map((event) => (
+              <TouchableOpacity
+                key={event.id}
+                style={styles.eventCard}
+                onPress={() => handleEventClick(event)}
+              >
+                <View style={styles.eventHeader}>
+                  <View style={styles.eventMainInfo}>
+                    <Text style={styles.eventPlate}>{event.plate_text}</Text>
+                    {event.state && (
+                      <Text style={styles.eventState}>{event.state}</Text>
+                    )}
+                  </View>
+                  <View
+                    style={[
+                      styles.eventBadge,
+                      event.result === 'approved' ? styles.approvedBadge : styles.violationBadge,
+                    ]}
+                  >
+                    <Text style={styles.eventBadgeText}>
+                      {event.result === 'approved' ? '✓' : '⚠'}
+                    </Text>
+                  </View>
+                </View>
+                <View style={styles.eventDetails}>
+                  <Text style={styles.eventDetailText}>
+                    {event.location} • {event.source || 'unknown'}
+                  </Text>
+                  <Text style={styles.eventTime}>{formatTimestamp(event.timestamp)}</Text>
+                </View>
+                {event.notes && (
+                  <Text style={styles.eventNotes}>{event.notes}</Text>
+                )}
+              </TouchableOpacity>
+            ))}
           </View>
-        ))}
-        {timedStays.length === 0 && (
-          <Text style={styles.emptyText}>No active timed stays</Text>
         )}
       </View>
 
-      {/* Violations */}
+      {/* Section 2: Active Parking (Timed Stays) */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Active Parking ({timedStays.length})</Text>
+        
+        {timedStays.length === 0 ? (
+          <Text style={styles.emptyText}>No active parked vehicles</Text>
+        ) : (
+          <View style={styles.timedStaysList}>
+            {timedStays.map((stay) => {
+              const dwellMinutes = calculateDwell(stay.first_seen);
+              const remaining = calculateTimeRemaining(stay.first_seen);
+              const isOverstay = remaining < 0;
+              
+              return (
+                <View key={stay.id} style={[
+                  styles.timedStayCard,
+                  isOverstay && styles.timedStayCardOverstay
+                ]}>
+                  <View style={styles.timedStayHeader}>
+                    <Text style={styles.timedStayPlate}>{stay.plate_text}</Text>
+                    {isOverstay && (
+                      <Text style={styles.overstayBadge}>OVERSTAY</Text>
+                    )}
+                  </View>
+                  
+                  <View style={styles.timedStayTimes}>
+                    <View style={styles.timedStayTimeRow}>
+                      <Text style={styles.timedStayLabel}>Scanned In:</Text>
+                      <Text style={styles.timedStayValue}>{formatTime(stay.first_seen)}</Text>
+                    </View>
+                    <View style={styles.timedStayTimeRow}>
+                      <Text style={styles.timedStayLabel}>Time Parked:</Text>
+                      <Text style={styles.timedStayValue}>{formatDwellTime(dwellMinutes)}</Text>
+                    </View>
+                    <View style={styles.timedStayTimeRow}>
+                      <Text style={styles.timedStayLabel}>Time Remaining:</Text>
+                      <Text style={[
+                        styles.timedStayValue,
+                        isOverstay ? styles.timedStayOverstay : styles.timedStayOk
+                      ]}>
+                        {isOverstay 
+                          ? `+${formatDwellTime(-remaining)}` 
+                          : formatDwellTime(remaining)
+                        }
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
+      </View>
+
+      {/* Section 3: Violations */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Recent Violations ({violations.length})</Text>
-        {violations.slice(0, 10).map((violation) => (
-          <View key={violation.id} style={styles.violationCard}>
-            <Text style={styles.violationPlate}>{violation.plate_text}</Text>
-            <Text style={styles.violationReason}>{violation.reason.replace('_', ' ')}</Text>
-            <Text style={styles.violationLocation}>{violation.location}</Text>
-            <Text style={styles.violationTime}>{formatTimestamp(violation.timestamp)}</Text>
-          </View>
-        ))}
-        {violations.length === 0 && (
+        
+        {violations.length === 0 ? (
           <Text style={styles.emptyText}>No violations</Text>
+        ) : (
+          <View style={styles.violationsList}>
+            {violations.slice(0, 10).map((violation) => (
+              <View key={violation.id} style={styles.violationCard}>
+                <View style={styles.violationHeader}>
+                  <Text style={styles.violationPlate}>{violation.plate_text}</Text>
+                  <Text style={styles.violationReason}>
+                    {violation.reason.replace(/_/g, ' ').toUpperCase()}
+                  </Text>
+                </View>
+                <View style={styles.violationDetails}>
+                  <Text style={styles.violationLocation}>{violation.location}</Text>
+                  <Text style={styles.violationTime}>{formatTimestamp(violation.timestamp)}</Text>
+                </View>
+              </View>
+            ))}
+          </View>
         )}
       </View>
 
-      {/* Recent Events */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Recent Events ({events.length})</Text>
-        {events.slice(0, 10).map((event) => (
-          <View key={event.id} style={styles.eventCard}>
-            <View style={styles.eventHeader}>
-              <Text style={styles.eventPlate}>{event.plate_text}</Text>
-              <View
-                style={[
-                  styles.eventBadge,
-                  event.result === 'approved' ? styles.approvedBadge : styles.violationBadge,
-                ]}
-              >
-                <Text style={styles.eventBadgeText}>{event.result}</Text>
+      {/* Edit Event Modal */}
+      <Modal
+        visible={showEditModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowEditModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Event Details</Text>
+            
+            {editingEvent && (
+              <View style={styles.modalBody}>
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Plate:</Text>
+                  <Text style={styles.modalValue}>{editingEvent.plate_text}</Text>
+                </View>
+                {editingEvent.state && (
+                  <View style={styles.modalRow}>
+                    <Text style={styles.modalLabel}>State:</Text>
+                    <Text style={styles.modalValue}>{editingEvent.state}</Text>
+                  </View>
+                )}
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Zone:</Text>
+                  <Text style={styles.modalValue}>{editingEvent.location}</Text>
+                </View>
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Source:</Text>
+                  <Text style={styles.modalValue}>{editingEvent.source || 'N/A'}</Text>
+                </View>
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Confidence:</Text>
+                  <Text style={styles.modalValue}>{(editingEvent.confidence * 100).toFixed(0)}%</Text>
+                </View>
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Result:</Text>
+                  <Text style={[
+                    styles.modalValue,
+                    editingEvent.result === 'approved' ? styles.approvedText : styles.violationText
+                  ]}>
+                    {editingEvent.result.toUpperCase()}
+                  </Text>
+                </View>
+                {editingEvent.notes && (
+                  <View style={styles.modalRow}>
+                    <Text style={styles.modalLabel}>Notes:</Text>
+                    <Text style={styles.modalValue}>{editingEvent.notes}</Text>
+                  </View>
+                )}
+                <View style={styles.modalRow}>
+                  <Text style={styles.modalLabel}>Time:</Text>
+                  <Text style={styles.modalValue}>{formatTimestamp(editingEvent.timestamp)}</Text>
+                </View>
               </View>
+            )}
+            
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.modalCloseButton}
+                onPress={() => setShowEditModal(false)}
+              >
+                <Text style={styles.buttonText}>Close</Text>
+              </TouchableOpacity>
             </View>
-            <Text style={styles.eventDetails}>
-              {event.location} • Conf: {(event.confidence * 100).toFixed(0)}%
-            </Text>
-            {event.notes && <Text style={styles.eventNotes}>{event.notes}</Text>}
-            <Text style={styles.eventTime}>{formatTimestamp(event.timestamp)}</Text>
           </View>
-        ))}
-        {events.length === 0 && (
-          <Text style={styles.emptyText}>No events yet</Text>
-        )}
-      </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -392,7 +413,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#333',
   },
-  cardHeader: {
+  sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
@@ -404,165 +425,25 @@ const styles = StyleSheet.create({
     color: '#FFF',
     marginBottom: 12,
   },
-  input: {
-    backgroundColor: '#000',
-    borderWidth: 1,
-    borderColor: '#333',
-    borderRadius: 8,
-    padding: 12,
-    color: '#FFF',
-    fontSize: 16,
-    marginBottom: 12,
-  },
-  inputRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 12,
-  },
-  label: {
-    color: '#888',
-    fontSize: 14,
-    marginBottom: 8,
-  },
-  radioGroup: {
-    marginBottom: 12,
-  },
-  radioButtons: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  radioButton: {
-    flex: 1,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#333',
-    alignItems: 'center',
-  },
-  radioButtonActive: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-  },
-  radioText: {
-    color: '#888',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  radioTextActive: {
-    color: '#FFF',
-  },
-  primaryButton: {
-    backgroundColor: '#007AFF',
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  secondaryButton: {
-    backgroundColor: '#4CAF50',
-    padding: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  addButton: {
-    backgroundColor: '#4CAF50',
-    padding: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minWidth: 60,
-  },
-  resetButton: {
-    backgroundColor: '#FF3B30',
+  expandButton: {
     paddingHorizontal: 12,
     paddingVertical: 6,
+    backgroundColor: '#333',
     borderRadius: 6,
   },
-  resetButtonText: {
+  expandButtonText: {
     color: '#FFF',
     fontSize: 12,
     fontWeight: '600',
   },
-  buttonText: {
-    color: '#FFF',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  listContainer: {
-    maxHeight: 120,
-  },
-  permitCard: {
-    backgroundColor: '#000',
-    padding: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#333',
-    marginRight: 8,
-    minWidth: 120,
-  },
-  permitPlate: {
-    color: '#FFD700',
-    fontSize: 16,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  permitType: {
-    color: '#888',
-    fontSize: 12,
-  },
-  stayCard: {
-    backgroundColor: '#000',
-    padding: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#333',
-    marginBottom: 8,
-  },
-  stayPlate: {
-    color: '#FFD700',
-    fontSize: 16,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  stayTime: {
-    color: '#FFA500',
-    fontSize: 14,
-    marginBottom: 2,
-  },
-  stayTimestamp: {
+  emptyText: {
     color: '#666',
-    fontSize: 11,
-  },
-  violationCard: {
-    backgroundColor: '#000',
-    padding: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#FF3B30',
-    marginBottom: 8,
-  },
-  violationPlate: {
-    color: '#FFD700',
-    fontSize: 16,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  violationReason: {
-    color: '#FF6B6B',
     fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 2,
-    textTransform: 'capitalize',
+    textAlign: 'center',
+    paddingVertical: 20,
   },
-  violationLocation: {
-    color: '#888',
-    fontSize: 12,
-    marginBottom: 2,
-  },
-  violationTime: {
-    color: '#666',
-    fontSize: 11,
+  eventsList: {
+    gap: 8,
   },
   eventCard: {
     backgroundColor: '#000',
@@ -570,23 +451,40 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     borderColor: '#333',
-    marginBottom: 8,
   },
   eventHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 4,
+    marginBottom: 8,
+  },
+  eventMainInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   eventPlate: {
     color: '#FFD700',
-    fontSize: 16,
+    fontSize: 18,
     fontWeight: 'bold',
+    fontFamily: 'monospace',
+    letterSpacing: 1,
   },
-  eventBadge: {
+  eventState: {
+    color: '#FFF',
+    fontSize: 14,
+    backgroundColor: '#007AFF',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 4,
+    fontWeight: '700',
+  },
+  eventBadge: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   approvedBadge: {
     backgroundColor: '#4CAF50',
@@ -596,29 +494,192 @@ const styles = StyleSheet.create({
   },
   eventBadgeText: {
     color: '#FFF',
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
   eventDetails: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  eventDetailText: {
     color: '#888',
     fontSize: 12,
-    marginBottom: 2,
-  },
-  eventNotes: {
-    color: '#AAA',
-    fontSize: 11,
-    fontStyle: 'italic',
-    marginBottom: 2,
   },
   eventTime: {
     color: '#666',
     fontSize: 11,
   },
-  emptyText: {
+  eventNotes: {
+    color: '#AAA',
+    fontSize: 11,
+    fontStyle: 'italic',
+    marginTop: 4,
+  },
+  timedStaysList: {
+    gap: 12,
+  },
+  timedStayCard: {
+    backgroundColor: '#000',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#4CAF50',
+  },
+  timedStayCardOverstay: {
+    borderColor: '#FF3B30',
+  },
+  timedStayHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  timedStayPlate: {
+    color: '#FFD700',
+    fontSize: 18,
+    fontWeight: 'bold',
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+  },
+  overstayBadge: {
+    color: '#FFF',
+    fontSize: 11,
+    backgroundColor: '#FF3B30',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+    fontWeight: '700',
+  },
+  timedStayTimes: {
+    gap: 6,
+  },
+  timedStayTimeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  timedStayLabel: {
+    color: '#888',
+    fontSize: 13,
+  },
+  timedStayValue: {
+    color: '#FFF',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  timedStayOk: {
+    color: '#4CAF50',
+  },
+  timedStayOverstay: {
+    color: '#FF3B30',
+    fontWeight: 'bold',
+  },
+  violationsList: {
+    gap: 8,
+  },
+  violationCard: {
+    backgroundColor: '#000',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#FF3B30',
+  },
+  violationHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  violationPlate: {
+    color: '#FFD700',
+    fontSize: 16,
+    fontWeight: 'bold',
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+  },
+  violationReason: {
+    color: '#FF6B6B',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  violationDetails: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  violationLocation: {
+    color: '#888',
+    fontSize: 12,
+  },
+  violationTime: {
     color: '#666',
-    fontSize: 14,
+    fontSize: 11,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: '#1a1a1a',
+    borderRadius: 16,
+    padding: 24,
+    width: '100%',
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  modalTitle: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#FFF',
+    marginBottom: 20,
     textAlign: 'center',
-    paddingVertical: 20,
+  },
+  modalBody: {
+    gap: 12,
+  },
+  modalRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#333',
+  },
+  modalLabel: {
+    color: '#888',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalValue: {
+    color: '#FFF',
+    fontSize: 14,
+    flex: 1,
+    textAlign: 'right',
+  },
+  approvedText: {
+    color: '#4CAF50',
+    fontWeight: 'bold',
+  },
+  violationText: {
+    color: '#FF3B30',
+    fontWeight: 'bold',
+  },
+  modalButtons: {
+    marginTop: 20,
+  },
+  modalCloseButton: {
+    backgroundColor: '#333',
+    padding: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  buttonText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
