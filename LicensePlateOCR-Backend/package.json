@@ -4,8 +4,10 @@
   "description": "Backend for license plate OCR",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "./start.sh",
+    "start:express": "node server.js",
+    "start:fastapi": "uvicorn enforcement_api:app --host 0.0.0.0 --port 8000 --reload",
+    "dev": "./start.sh"
   },
   "dependencies": {
     "cors": "^2.8.5",

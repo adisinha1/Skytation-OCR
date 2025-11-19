@@ -38,6 +38,13 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => <Ionicons name="camera" size={28} color={color} />,
         }}
       />
+      <Tabs.Screen
+        name="enforcement"
+        options={{
+          title: 'Enforcement',
+          tabBarIcon: ({ color }) => <Ionicons name="shield-checkmark" size={28} color={color} />,
+        }}
+      />
     </Tabs>
   );
 }
