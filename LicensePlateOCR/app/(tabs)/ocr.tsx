@@ -29,12 +29,32 @@ export default function OCRScreen() {
   const [captureSource, setCaptureSource] = useState<'phone' | 'drone'>('phone');
 
   const BACKEND_URL = 'http://10.0.0.67:5001';
+  const ENFORCEMENT_URL = 'http://10.0.0.67:8000';
 
   React.useEffect(() => {
     if (!permission?.granted) {
       requestPermission();
     }
   }, [permission]);
+
+  const logToEnforcement = async (plateNumber: string, state: string | null, confidence: number, source: 'phone' | 'drone') => {
+    try {
+      await fetch(`${ENFORCEMENT_URL}/api/ocr_event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          plate_text: plateNumber,
+          confidence: confidence,
+          timestamp: new Date().toISOString(),
+          location: 'timed', // Will auto-detect permit
+          state: state,
+          source: source,
+        }),
+      });
+    } catch (error) {
+      console.error('Error logging to enforcement:', error);
+    }
+  };
 
   const handleTakePhoto = async () => {
     if (!cameraRef.current || isProcessing) return;
@@ -81,6 +101,14 @@ export default function OCRScreen() {
             stateAbbreviation: data.classification.state_abbreviation,
             image: `data:image/jpg;base64,${photo.base64}`,
           });
+          
+          // Log to enforcement system
+          await logToEnforcement(
+            data.classification.license_number,
+            data.classification.state_abbreviation,
+            data.confidence || 0,
+            'phone'
+          );
         }
       } else {
         setRawText('Backend error');
@@ -132,6 +160,14 @@ export default function OCRScreen() {
             stateAbbreviation: data.classification.state_abbreviation,
             image: data.captured_image,
           });
+          
+          // Log to enforcement system
+          await logToEnforcement(
+            data.classification.license_number,
+            data.classification.state_abbreviation,
+            data.confidence || 0,
+            'drone'
+          );
         }
       } else {
         const errorData = await response.json();

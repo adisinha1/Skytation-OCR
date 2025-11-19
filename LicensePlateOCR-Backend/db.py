@@ -23,6 +23,7 @@ class Event(Base):
 
     id         = Column(Integer, primary_key=True, index=True)
     plate_text = Column(String(32), index=True, nullable=False)
+    state      = Column(String(2), nullable=True)  # State abbreviation
     confidence = Column(Float, nullable=True)  # 0..1
     # Use Python default; SQLite doesn't truly enforce timezone, but we keep tzinfo=UTC.
     timestamp  = Column(DateTime(timezone=True), default=aware_now, nullable=False)
@@ -30,6 +31,7 @@ class Event(Base):
     image_hash = Column(String(64), nullable=True)
     result     = Column(String(16), nullable=False, default="unknown")  # "approved" | "violation" | "unknown"
     notes      = Column(Text, nullable=True)
+    source     = Column(String(16), nullable=True)  # "phone" | "drone" | "manual"
 
 # --- Permits: simple allowlist of plates ---
 class Permit(Base):
@@ -37,6 +39,7 @@ class Permit(Base):
 
     id         = Column(Integer, primary_key=True)
     plate_text = Column(String(32), unique=True, index=True, nullable=False)
+    state      = Column(String(2), nullable=True)  # State abbreviation
     permit_type = Column(String(16), nullable=True)  # optional (A/B/C/etc.)
     notes       = Column(Text, nullable=True)
 

@@ -67,54 +67,50 @@ class OCREventIn(BaseModel):
     confidence: float = Field(..., ge=0, le=1)
     timestamp: Optional[datetime] = None
     location: str = Field(..., pattern="^(permit|timed)$")
+    state: Optional[str] = None
     image_hash: Optional[str] = None
+    source: Optional[str] = None  # "phone" | "drone" | "manual"
 
 
 CONF_THRESHOLD = 0.95
 TIMED_LIMIT_MIN = 2  # for demo
 
 # ---------------------------------------------------------------------
-# Core OCR Event Decision Flow
+# Core OCR Event Decision Flow (with auto-classification)
 # ---------------------------------------------------------------------
 @app.post("/api/ocr_event")
 def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
     ts = as_aware(body.timestamp)
     plate = body.plate_text.strip().upper()
+    state = body.state
+    source = body.source or "manual"
+
+    # Auto-detect if plate has permit (override location to permit if found)
+    permit_match = db.query(Permit).filter(Permit.plate_text == plate).first()
+    actual_location = "permit" if permit_match else "timed"
 
     # 1. Confidence gate
     if body.confidence < CONF_THRESHOLD:
         ev = Event(
-            plate_text=plate, confidence=body.confidence, timestamp=ts,
-            location=body.location, result="violation", notes="low_confidence"
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location=actual_location, result="violation", notes="low_confidence", source=source
         )
         db.add(ev); db.commit()
         db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
-                         location=body.location, reason="low_confidence"))
+                         location=actual_location, reason="low_confidence"))
         db.commit()
         return {"result": "violation", "reason": "low_confidence", "message": "Confidence below threshold"}
 
-    # 2. Permit Zone
-    if body.location == "permit":
-        match = db.query(Permit).filter(Permit.plate_text == plate).first()
-        if match:
-            ev = Event(
-                plate_text=plate, confidence=body.confidence, timestamp=ts,
-                location="permit", result="approved", notes="permit_found"
-            )
-            db.add(ev); db.commit()
-            return {"result": "approved", "reason": "permit_found", "message": "Permit approved"}
-        else:
-            ev = Event(
-                plate_text=plate, confidence=body.confidence, timestamp=ts,
-                location="permit", result="violation", notes="no_permit"
-            )
-            db.add(ev); db.commit()
-            db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
-                             location="permit", reason="no_permit"))
-            db.commit()
-            return {"result": "violation", "reason": "no_permit", "message": "No matching permit"}
+    # 2. Permit detected - always approved
+    if permit_match:
+        ev = Event(
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="permit", result="approved", notes="permit_found", source=source
+        )
+        db.add(ev); db.commit()
+        return {"result": "approved", "reason": "permit_found", "message": f"Permit approved for {plate}"}
 
-    # 3. Timed Zone
+    # 3. Timed Zone (no permit found)
     stay = db.query(TimedStay).filter(TimedStay.plate_text == plate).first()
 
     if not stay:
@@ -124,8 +120,8 @@ def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
         db.commit()
 
         ev = Event(
-            plate_text=plate, confidence=body.confidence, timestamp=ts,
-            location="timed", result="approved", notes="timed_first_seen"
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="timed", result="approved", notes="timed_first_seen", source=source
         )
         db.add(ev); db.commit()
         return {
@@ -143,8 +139,8 @@ def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
 
     if dwell > TIMED_LIMIT_MIN:
         ev = Event(
-            plate_text=plate, confidence=body.confidence, timestamp=ts,
-            location="timed", result="violation", notes=f"exceeded_time:{dwell:.1f}m"
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="timed", result="violation", notes=f"exceeded_time:{dwell:.1f}m", source=source
         )
         db.add(ev); db.commit()
         db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
@@ -160,8 +156,8 @@ def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
 
     # still within limit
     ev = Event(
-        plate_text=plate, confidence=body.confidence, timestamp=ts,
-        location="timed", result="approved", notes=f"timed_ok:{dwell:.1f}m"
+        plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+        location="timed", result="approved", notes=f"timed_ok:{dwell:.1f}m", source=source
     )
     db.add(ev); db.commit()
     return {
@@ -171,6 +167,7 @@ def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
         "dwell_minutes": dwell,
         "limit_minutes": TIMED_LIMIT_MIN
     }
+
 
 
 # ---------------------------------------------------------------------
