@@ -1,36 +1,29 @@
 #!/bin/bash
 
-# Unified Backend Startup Script
-# Runs both Express (OCR) and FastAPI (Enforcement) servers
+# Kill any existing processes
+pkill -f "uvicorn enforcement_api:app" 2>/dev/null
+pkill -f "node server.js" 2>/dev/null
 
-echo "🚀 Starting Unified Skytation Backend..."
+echo "Starting License Plate OCR Backend..."
 echo ""
-
 
 # Activate virtual environment
-echo "🔧 Activating Python virtual environment..."
-source ~/ocr-env/bin/activate
+source venv/bin/activate
 
-# Install Python dependencies
-echo "📦 Installing Python dependencies..."
-pip install -q -r requirements.txt
-
-echo ""
-echo "✅ Setup complete!"
-echo ""
-echo "🎯 Starting servers..."
-echo "   - Express (OCR API): http://0.0.0.0:5001"
-echo "   - FastAPI (Enforcement API): http://0.0.0.0:8000"
+echo "Python location: $(which python3)"
+echo "Virtual environment: $(pwd)/venv"
 echo ""
 
-# Start FastAPI server in background
-uvicorn enforcement_api:app --host 0.0.0.0 --port 8000 --reload &
+# Start FastAPI (Port 8000) - Enforcement API with proper exclusions
+uvicorn enforcement_api:app --host 0.0.0.0 --port 8000 --reload \
+  --reload-exclude 'venv/*' \
+  --reload-exclude '*.pyc' \
+  --reload-exclude '__pycache__/*' &
+
 FASTAPI_PID=$!
-
-# Wait a moment for FastAPI to start
 sleep 2
 
-# Start Express server in foreground
+# Start Express (Port 5001) - OCR API
 node server.js &
 EXPRESS_PID=$!
 
@@ -41,8 +34,8 @@ echo "   Express PID: $EXPRESS_PID"
 echo ""
 echo "Press Ctrl+C to stop all servers"
 
-# Trap Ctrl+C to kill both processes
-trap "kill $FASTAPI_PID $EXPRESS_PID 2>/dev/null; exit" SIGINT SIGTERM
+# Trap to kill both servers on exit
+trap "kill $FASTAPI_PID $EXPRESS_PID 2>/dev/null" EXIT
 
 # Wait for both processes
 wait

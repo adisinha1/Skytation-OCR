@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 from typing import Optional
+import math
 
-from db import SessionLocal, Base, engine, Event, Permit, TimedStay, Violation
+from db import SessionLocal, Base, engine, Event, Permit, TimedStay, Violation, Zone
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -23,6 +24,38 @@ def as_aware(dt: datetime | None) -> datetime:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two GPS coordinates in meters using Haversine formula"""
+    R = 6371000  # Earth's radius in meters
+    
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_phi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
+
+def find_zone_by_gps(latitude: float, longitude: float, db: Session) -> Optional[Zone]:
+    """Find the closest zone within radius based on GPS coordinates"""
+    zones = db.query(Zone).all()
+    
+    closest_zone = None
+    min_distance = float('inf')
+    
+    for zone in zones:
+        distance = calculate_distance(latitude, longitude, zone.latitude, zone.longitude)
+        # Convert radius from degrees to meters (approximate: 1 degree ≈ 111,000 meters)
+        radius_meters = zone.radius * 111000
+        
+        if distance <= radius_meters and distance < min_distance:
+            closest_zone = zone
+            min_distance = distance
+    
+    return closest_zone
+
 
 # ---------------------------------------------------------------------
 # FastAPI Setup
@@ -31,7 +64,7 @@ app = FastAPI(title="Skytation Parking Enforcement API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for mobile app access
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,18 +99,21 @@ class OCREventIn(BaseModel):
     plate_text: str
     confidence: float = Field(..., ge=0, le=1)
     timestamp: Optional[datetime] = None
-    location: str = Field(..., pattern="^(permit|timed)$")
+    location: str = Field(..., pattern="^(permit|timed)$")  # This will be overridden by GPS
     state: Optional[str] = None
     image_hash: Optional[str] = None
-    source: Optional[str] = None  # "phone" | "drone" | "manual"
+    source: Optional[str] = None
+    image_data: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
-# Changed from 0.95 to 0.85 (85%) - more lenient threshold
 CONF_THRESHOLD = 0.85
-TIMED_LIMIT_MIN = 120  # Default 2 hours for Purdue parking
+TIMED_LIMIT_MIN = 120
+GRACE_PERIOD_MIN = 30  # Auto-expire after limit + grace period
 
 # ---------------------------------------------------------------------
-# Core OCR Event Decision Flow (with auto-classification)
+# Core OCR Event Decision Flow
 # ---------------------------------------------------------------------
 @app.post("/api/ocr_event")
 def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
@@ -85,109 +121,240 @@ def ocr_event(body: OCREventIn, db: Session = Depends(get_db)):
     plate = body.plate_text.strip().upper()
     state = body.state
     source = body.source or "manual"
+    image_data = body.image_data
 
-    # Auto-detect if plate has permit (override location to permit if found)
+    # GPS-based zone detection
+    detected_zone = None
+    zone_type = body.location  # Default fallback
+    time_limit = TIMED_LIMIT_MIN
+    lot_name = None
+    
+    if body.latitude is not None and body.longitude is not None:
+        detected_zone = find_zone_by_gps(body.latitude, body.longitude, db)
+        if detected_zone:
+            zone_type = detected_zone.zone_type
+            time_limit = detected_zone.default_time_limit
+            lot_name = detected_zone.name
+            print(f"GPS: Detected zone '{detected_zone.name}' ({detected_zone.zone_type}) at {body.latitude}, {body.longitude}")
+        else:
+            print(f"GPS: No zone found at {body.latitude}, {body.longitude}, using default: {zone_type}")
+    
+    # Check for permit
     permit_match = db.query(Permit).filter(Permit.plate_text == plate).first()
-    actual_location = "permit" if permit_match else "timed"
 
-    # 1. Confidence gate
+    # 1. Low confidence - just log it, don't create violation
     if body.confidence < CONF_THRESHOLD:
         ev = Event(
             plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
-            location=actual_location, result="violation", notes="low_confidence", source=source
+            location=zone_type, result="unknown", notes="low_confidence", 
+            source=source, image_data=image_data, lot_name=lot_name
         )
-        db.add(ev); db.commit()
+        db.add(ev)
+        db.commit()
         db.refresh(ev)
+        return {"result": "unknown", "reason": "low_confidence", 
+                "message": f"Confidence {body.confidence:.1%} below threshold - needs review",
+                "event_id": ev.id, "detected_zone": lot_name, "zone_type": zone_type}
+
+    # 2. PERMIT ZONE - No permit = VIOLATION
+    if zone_type == "permit" and not permit_match:
+        ev = Event(
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="permit", result="violation", notes="no_permit", 
+            source=source, image_data=image_data, lot_name=lot_name
+        )
+        db.add(ev)
+        db.commit()
+        db.refresh(ev)
+        
+        # Create violation
         db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
-                         location=actual_location, reason="low_confidence"))
+                         location="permit", reason="no_permit"))
         db.commit()
-        return {"result": "violation", "reason": "low_confidence", "message": f"Confidence {body.confidence:.1%} below threshold {CONF_THRESHOLD:.0%}"}
-
-    # 2. Permit detected - always approved
-    if permit_match:
-        ev = Event(
-            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
-            location="permit", result="approved", notes="permit_found", source=source
-        )
-        db.add(ev); db.commit()
-        db.refresh(ev)
-        return {"result": "approved", "reason": "permit_found", "message": f"Permit approved for {plate}"}
-
-    # 3. Timed Zone (no permit found)
-    stay = db.query(TimedStay).filter(TimedStay.plate_text == plate).first()
-
-    if not stay:
-        # new timed entry with default time limit
-        stay = TimedStay(plate_text=plate, first_seen=ts, last_seen=ts, time_limit_minutes=TIMED_LIMIT_MIN)
-        db.add(stay)
-        db.commit()
-        db.refresh(stay)
-
-        ev = Event(
-            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
-            location="timed", result="approved", notes="timed_first_seen", source=source,
-            time_limit_minutes=TIMED_LIMIT_MIN
-        )
-        db.add(ev); db.commit()
-        db.refresh(ev)
-        return {
-            "result": "approved",
-            "reason": "timed_first_seen",
-            "message": f"Started dwell timer for {plate}",
-            "dwell_minutes": 0,
-            "limit_minutes": TIMED_LIMIT_MIN
-        }
-
-    # existing entry → compute dwell time using stay's time limit
-    time_limit = stay.time_limit_minutes or TIMED_LIMIT_MIN
-    dwell = (ts - as_aware(stay.first_seen)).total_seconds() / 60
-    stay.last_seen = ts
-    db.commit()
-
-    if dwell > time_limit:
-        ev = Event(
-            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
-            location="timed", result="violation", notes=f"exceeded_time:{dwell:.1f}m", source=source,
-            time_limit_minutes=time_limit
-        )
-        db.add(ev); db.commit()
-        db.refresh(ev)
-        db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
-                         location="timed", reason="exceeded_time"))
-        db.commit()
+        
         return {
             "result": "violation",
-            "reason": "exceeded_time",
-            "message": f"Exceeded time limit ({dwell:.1f} > {time_limit} min)",
-            "dwell_minutes": dwell,
-            "limit_minutes": time_limit
+            "reason": "no_permit",
+            "message": f"VIOLATION: No permit for permit zone {lot_name or ''}",
+            "event_id": ev.id,
+            "detected_zone": lot_name,
+            "zone_type": "permit"
         }
 
-    # still within limit
+    # 3. PERMIT ZONE - Has permit = APPROVED
+    if zone_type == "permit" and permit_match:
+        ev = Event(
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="permit", result="approved", notes="permit_found", 
+            source=source, image_data=image_data, lot_name=lot_name
+        )
+        db.add(ev)
+        db.commit()
+        db.refresh(ev)
+        return {"result": "approved", "reason": "permit_found", 
+                "message": f"Permit approved for {plate} in {lot_name or 'permit zone'}", 
+                "event_id": ev.id, "detected_zone": lot_name, "zone_type": "permit"}
+
+    # 4. TIMED ZONE - Even permit holders get timed stays
+    if zone_type == "timed":
+        stay = db.query(TimedStay).filter(TimedStay.plate_text == plate).first()
+
+        if not stay:
+            # First time seeing this plate - start timer
+            stay = TimedStay(
+                plate_text=plate, first_seen=ts, last_seen=ts, 
+                time_limit_minutes=time_limit, lot_name=lot_name
+            )
+            db.add(stay)
+            db.commit()
+            db.refresh(stay)
+
+            notes = "timed_first_seen_permit" if permit_match else "timed_first_seen"
+            ev = Event(
+                plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+                location="timed", result="approved", notes=notes, 
+                source=source, time_limit_minutes=time_limit, image_data=image_data,
+                lot_name=lot_name
+            )
+            db.add(ev)
+            db.commit()
+            db.refresh(ev)
+            
+            permit_status = " (Has Permit)" if permit_match else ""
+            return {
+                "result": "approved",
+                "reason": notes,
+                "message": f"Started timer for {plate} in {lot_name or 'timed zone'}{permit_status}",
+                "dwell_minutes": 0,
+                "limit_minutes": time_limit,
+                "event_id": ev.id,
+                "detected_zone": lot_name,
+                "zone_type": "timed"
+            }
+
+        # Existing stay - check if over limit
+        current_time_limit = stay.time_limit_minutes or time_limit
+        dwell = (ts - as_aware(stay.first_seen)).total_seconds() / 60
+        
+        if dwell > current_time_limit:
+            # VIOLATION - over time limit on re-scan
+            ev = Event(
+                plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+                location="timed", result="violation", notes=f"exceeded_time:{dwell:.1f}m", 
+                source=source, time_limit_minutes=current_time_limit, image_data=image_data,
+                lot_name=lot_name
+            )
+            db.add(ev)
+            db.commit()
+            db.refresh(ev)
+            
+            # Create violation
+            db.add(Violation(event_id=ev.id, plate_text=plate, timestamp=ts,
+                             location="timed", reason="exceeded_time"))
+            
+            # Remove from active parking
+            db.delete(stay)
+            db.commit()
+            
+            return {
+                "result": "violation",
+                "reason": "exceeded_time",
+                "message": f"VIOLATION: Exceeded {current_time_limit}min limit by {dwell - current_time_limit:.0f}min",
+                "dwell_minutes": dwell,
+                "limit_minutes": current_time_limit,
+                "event_id": ev.id,
+                "detected_zone": lot_name,
+                "zone_type": "timed"
+            }
+
+        # Still within time limit
+        stay.last_seen = ts
+        if lot_name and not stay.lot_name:
+            stay.lot_name = lot_name
+        db.commit()
+
+        notes = f"timed_ok:{dwell:.1f}m_permit" if permit_match else f"timed_ok:{dwell:.1f}m"
+        ev = Event(
+            plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
+            location="timed", result="approved", notes=notes, 
+            source=source, time_limit_minutes=current_time_limit, image_data=image_data,
+            lot_name=lot_name
+        )
+        db.add(ev)
+        db.commit()
+        db.refresh(ev)
+        
+        return {
+            "result": "approved",
+            "reason": "timed_ok",
+            "message": f"OK: {current_time_limit - dwell:.0f}min remaining in {lot_name or 'timed zone'}",
+            "dwell_minutes": dwell,
+            "limit_minutes": current_time_limit,
+            "event_id": ev.id,
+            "detected_zone": lot_name,
+            "zone_type": "timed"
+        }
+    
+    # Fallback (should not reach here)
     ev = Event(
         plate_text=plate, state=state, confidence=body.confidence, timestamp=ts,
-        location="timed", result="approved", notes=f"timed_ok:{dwell:.1f}m", source=source,
-        time_limit_minutes=time_limit
+        location=zone_type, result="unknown", notes="fallback", 
+        source=source, image_data=image_data, lot_name=lot_name
     )
-    db.add(ev); db.commit()
+    db.add(ev)
+    db.commit()
     db.refresh(ev)
+    
     return {
-        "result": "approved",
-        "reason": "timed_ok",
-        "message": f"Within limit ({dwell:.1f}/{time_limit} min)",
-        "dwell_minutes": dwell,
-        "limit_minutes": time_limit
+        "result": "unknown",
+        "reason": "fallback",
+        "message": f"Unexpected zone type",
+        "event_id": ev.id,
+        "detected_zone": lot_name,
+        "zone_type": zone_type
     }
 
 
+# ---------------------------------------------------------------------
+# Auto-expire overstays
+# ---------------------------------------------------------------------
+@app.post("/api/timed/expire")
+def expire_overstays(db: Session = Depends(get_db)):
+    """Auto-expire vehicles that exceeded time limit + grace period"""
+    now = utcnow()
+    expired_count = 0
+    
+    stays = db.query(TimedStay).all()
+    for stay in stays:
+        time_limit = stay.time_limit_minutes or TIMED_LIMIT_MIN
+        first_seen = as_aware(stay.first_seen)
+        dwell = (now - first_seen).total_seconds() / 60
+        
+        # If over limit + grace period, auto-expire
+        if dwell > (time_limit + GRACE_PERIOD_MIN):
+            # Create violation
+            db.add(Violation(
+                event_id=0,  # No specific event
+                plate_text=stay.plate_text, 
+                timestamp=now,
+                location="timed", 
+                reason="exceeded_time"
+            ))
+            
+            # Remove from active parking
+            db.delete(stay)
+            expired_count += 1
+    
+    db.commit()
+    return {"ok": True, "expired": expired_count}
+
 
 # ---------------------------------------------------------------------
-# Support Routes
+# Events
 # ---------------------------------------------------------------------
 @app.get("/api/events")
 def list_events(db: Session = Depends(get_db)):
     events = db.query(Event).order_by(Event.id.desc()).limit(50).all()
-    # Convert to dict to ensure all fields are serialized properly
     return [
         {
             "id": e.id,
@@ -201,9 +368,45 @@ def list_events(db: Session = Depends(get_db)):
             "source": e.source,
             "time_limit_minutes": e.time_limit_minutes,
             "lot_name": e.lot_name,
+            "has_image": e.image_data is not None,
         }
         for e in events
     ]
+
+@app.get("/api/events/{event_id}")
+def get_event(event_id: int, db: Session = Depends(get_db)):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    return {
+        "id": event.id,
+        "plate_text": event.plate_text,
+        "state": event.state,
+        "confidence": event.confidence,
+        "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+        "location": event.location,
+        "result": event.result,
+        "notes": event.notes,
+        "source": event.source,
+        "time_limit_minutes": event.time_limit_minutes,
+        "lot_name": event.lot_name,
+        "image_data": event.image_data,
+    }
+
+@app.delete("/api/events/{event_id}")
+def delete_event(event_id: int, db: Session = Depends(get_db)):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Also delete associated violations
+    db.query(Violation).filter(Violation.event_id == event_id).delete()
+    
+    # Delete the event
+    db.delete(event)
+    db.commit()
+    return {"ok": True, "message": f"Event {event_id} deleted"}
 
 @app.get("/api/violations")
 def list_violations(db: Session = Depends(get_db)):
@@ -243,6 +446,15 @@ def get_timed_stays(db: Session = Depends(get_db)):
         }
         for s in stays
     ]
+
+@app.delete("/api/timed_stays/{stay_id}")
+def delete_timed_stay(stay_id: int, db: Session = Depends(get_db)):
+    stay = db.query(TimedStay).filter(TimedStay.id == stay_id).first()
+    if not stay:
+        raise HTTPException(status_code=404, detail="Timed stay not found")
+    db.delete(stay)
+    db.commit()
+    return {"ok": True, "message": f"Timed stay {stay_id} cleared"}
 
 @app.get("/api/permits")
 def get_permits(db: Session = Depends(get_db)):
@@ -310,10 +522,10 @@ def reset_timed(db: Session = Depends(get_db)):
     return {"ok": True}
 
 # ---------------------------------------------------------------------
-# Event and TimedStay Update Routes
+# Event Update
 # ---------------------------------------------------------------------
 class EventUpdate(BaseModel):
-    location: Optional[str] = None  # "permit" or "timed"
+    location: Optional[str] = None
     time_limit_minutes: Optional[int] = None
     lot_name: Optional[str] = None
     notes: Optional[str] = None
@@ -324,7 +536,6 @@ def update_event(event_id: int, updates: EventUpdate, db: Session = Depends(get_
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     
-    # Update event fields
     if updates.location is not None:
         event.location = updates.location
     if updates.time_limit_minutes is not None:
@@ -337,7 +548,6 @@ def update_event(event_id: int, updates: EventUpdate, db: Session = Depends(get_
     db.commit()
     db.refresh(event)
     
-    # If changing to timed, update or create TimedStay
     if updates.location == "timed" or updates.time_limit_minutes is not None:
         stay = db.query(TimedStay).filter(TimedStay.plate_text == event.plate_text).first()
         if stay:
@@ -347,7 +557,6 @@ def update_event(event_id: int, updates: EventUpdate, db: Session = Depends(get_
                 stay.lot_name = updates.lot_name
             db.commit()
     
-    # Return serialized event
     return {
         "id": event.id,
         "plate_text": event.plate_text,
@@ -386,7 +595,111 @@ def update_timed_stay(stay_id: int, updates: dict, db: Session = Depends(get_db)
 
 
 # ---------------------------------------------------------------------
-# WebSocket for live UI updates
+# Zone Management
+# ---------------------------------------------------------------------
+@app.get("/api/zones")
+def get_zones(db: Session = Depends(get_db)):
+    zones = db.query(Zone).order_by(Zone.name).all()
+    return [
+        {
+            "id": z.id,
+            "name": z.name,
+            "code": z.code,
+            "latitude": z.latitude,
+            "longitude": z.longitude,
+            "radius": z.radius,
+            "zone_type": z.zone_type,
+            "default_time_limit": z.default_time_limit,
+            "created_at": z.created_at.isoformat() if z.created_at else None,
+        }
+        for z in zones
+    ]
+
+@app.post("/api/zones")
+def add_zone(zone: dict, db: Session = Depends(get_db)):
+    name = zone.get("name", "").strip()
+    code = zone.get("code", "").strip()
+    
+    if not name or not code:
+        raise HTTPException(status_code=400, detail="name and code are required")
+    
+    latitude = zone.get("latitude")
+    longitude = zone.get("longitude")
+    
+    if latitude is None or longitude is None:
+        raise HTTPException(status_code=400, detail="latitude and longitude are required")
+    
+    new_zone = Zone(
+        name=name,
+        code=code,
+        latitude=latitude,
+        longitude=longitude,
+        radius=zone.get("radius", 0.0005),
+        zone_type=zone.get("zone_type", "timed"),
+        default_time_limit=zone.get("default_time_limit", 120),
+    )
+    db.add(new_zone)
+    db.commit()
+    db.refresh(new_zone)
+    
+    return {
+        "id": new_zone.id,
+        "name": new_zone.name,
+        "code": new_zone.code,
+        "latitude": new_zone.latitude,
+        "longitude": new_zone.longitude,
+        "radius": new_zone.radius,
+        "zone_type": new_zone.zone_type,
+        "default_time_limit": new_zone.default_time_limit,
+        "created_at": new_zone.created_at.isoformat() if new_zone.created_at else None,
+    }
+
+@app.delete("/api/zones/{zone_id}")
+def delete_zone(zone_id: int, db: Session = Depends(get_db)):
+    zone = db.query(Zone).filter(Zone.id == zone_id).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    db.delete(zone)
+    db.commit()
+    return {"ok": True, "message": f"Zone {zone_id} deleted"}
+
+@app.post("/api/zones/seed")
+def seed_zones(db: Session = Depends(get_db)):
+    sample_zones = [
+        {"name": "Parking Lot A", "code": "A1", "latitude": 40.4237, "longitude": -86.9212, "zone_type": "permit"},
+        {"name": "Parking Lot B", "code": "B1", "latitude": 40.4251, "longitude": -86.9156, "zone_type": "timed", "default_time_limit": 120},
+        {"name": "Visitor Parking", "code": "V1", "latitude": 40.4268, "longitude": -86.9134, "zone_type": "timed", "default_time_limit": 60},
+        {"name": "Staff Lot C", "code": "C1", "latitude": 40.4245, "longitude": -86.9098, "zone_type": "permit"},
+        {"name": "Student Lot D", "code": "D1", "latitude": 40.4229, "longitude": -86.9078, "zone_type": "timed", "default_time_limit": 240},
+    ]
+    
+    seeded = []
+    for z in sample_zones:
+        existing = db.query(Zone).filter(Zone.code == z["code"]).first()
+        if not existing:
+            new_zone = Zone(
+                name=z["name"],
+                code=z["code"],
+                latitude=z["latitude"],
+                longitude=z["longitude"],
+                zone_type=z.get("zone_type", "timed"),
+                default_time_limit=z.get("default_time_limit", 120),
+            )
+            db.add(new_zone)
+            seeded.append(z["name"])
+    
+    db.commit()
+    return {"seeded": seeded, "message": f"Seeded {len(seeded)} zones"}
+
+@app.delete("/api/zones/clear")
+def clear_zones(db: Session = Depends(get_db)):
+    count = db.query(Zone).delete()
+    db.commit()
+    return {"ok": True, "deleted": count}
+
+
+# ---------------------------------------------------------------------
+# WebSocket
 # ---------------------------------------------------------------------
 class WSManager:
     def __init__(self):

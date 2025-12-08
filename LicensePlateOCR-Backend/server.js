@@ -12,6 +12,11 @@ console.log('Starting License Plate OCR Backend...');
 // Configuration - Update this with your stream URL
 const STREAM_URL = process.env.STREAM_URL || 'rtsp://10.0.0.16:8554/camera';
 
+// Hardcoded Python path for venv
+const PYTHON_PATH = '/Users/adisinha/ocr-env/bin/python3';
+
+console.log(`Using Python: ${PYTHON_PATH}`);
+
 // Existing endpoint for phone camera
 app.post('/process-frame', (req, res) => {
   const { frame } = req.body;
@@ -20,7 +25,8 @@ app.post('/process-frame', (req, res) => {
     return res.status(400).json({ error: 'No frame provided' });
   }
 
-  const python = spawn('python3', [path.join(__dirname, 'process_frame.py')]);
+  console.log('Processing frame from phone camera...');
+  const python = spawn(PYTHON_PATH, [path.join(__dirname, 'process_frame.py')]);
   let result = '';
   let error = '';
 
@@ -30,30 +36,34 @@ app.post('/process-frame', (req, res) => {
 
   python.stderr.on('data', (data) => {
     error += data.toString();
-    console.error('Python error:', data.toString());
+    console.error('Python stderr:', data.toString());
   });
 
   python.stdin.write(JSON.stringify({ frame }));
   python.stdin.end();
 
   python.on('close', (code) => {
+    console.log(`Python process exited with code: ${code}`);
     if (code === 0 && result) {
       try {
         const parsed = JSON.parse(result);
-        console.log('Result:', parsed.text, 'Confidence:', parsed.confidence);
+        console.log('Result:', parsed.classification?.license_number || 'No plate', 'Confidence:', parsed.confidence);
         res.json(parsed);
       } catch (e) {
         console.error('JSON parse error:', e);
+        console.error('Raw result:', result);
         res.status(500).json({ error: 'Invalid response from processor', text: '', confidence: 0 });
       }
     } else {
-      console.error('Python process exited with code:', code);
+      console.error('Processing failed with code:', code);
+      console.error('Error output:', error);
       res.status(500).json({ error: error || 'Processing failed', text: '', confidence: 0 });
     }
   });
 
   setTimeout(() => {
     if (python.exitCode === null) {
+      console.error('Processing timeout - killing process');
       python.kill();
       res.status(500).json({ error: 'Processing timeout', text: '', confidence: 0 });
     }
@@ -76,21 +86,16 @@ import sys
 stream_url = "${streamUrl}"
 
 try:
-    # Use FFMPEG backend with optimized settings for RTSP
     cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
     
     if not cap.isOpened():
         print(json.dumps({'success': False, 'error': 'Failed to open stream'}))
         sys.exit(1)
     
-    # Set buffer size to minimum for latest frame
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
-    # Try to set high resolution (may already be set by stream)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     
-    # Read multiple frames to flush buffer and get the latest one
     frame = None
     for _ in range(10):
         ret, frame = cap.read()
@@ -103,7 +108,6 @@ try:
         print(json.dumps({'success': False, 'error': 'Failed to capture frame'}))
         sys.exit(1)
     
-    # Encode with maximum quality
     _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 98])
     frame_base64 = base64.b64encode(buffer).decode('utf-8')
     
@@ -119,7 +123,7 @@ except Exception as e:
     sys.exit(1)
 `;
 
-  const captureProcess = spawn('python3', ['-c', captureScript]);
+  const captureProcess = spawn(PYTHON_PATH, ['-c', captureScript]);
   let captureResult = '';
   let captureError = '';
 
@@ -129,7 +133,7 @@ except Exception as e:
 
   captureProcess.stderr.on('data', (data) => {
     captureError += data.toString();
-    console.error('Capture error:', data.toString());
+    console.error('Capture stderr:', data.toString());
   });
 
   captureProcess.on('close', (captureCode) => {
@@ -161,8 +165,7 @@ except Exception as e:
 
     console.log(`Captured frame: ${captureData.width}x${captureData.height}`);
 
-    // Step 2: Process the captured frame with OCR
-    const ocrProcess = spawn('python3', [path.join(__dirname, 'process_frame.py')]);
+    const ocrProcess = spawn(PYTHON_PATH, [path.join(__dirname, 'process_frame.py')]);
     let ocrResult = '';
     let ocrError = '';
 
@@ -172,7 +175,7 @@ except Exception as e:
 
     ocrProcess.stderr.on('data', (data) => {
       ocrError += data.toString();
-      console.error('OCR error:', data.toString());
+      console.error('OCR stderr:', data.toString());
     });
 
     ocrProcess.stdin.write(JSON.stringify({ frame: captureData.frame }));
@@ -184,7 +187,6 @@ except Exception as e:
           const parsed = JSON.parse(ocrResult);
           console.log('Drone OCR Result:', parsed.classification?.license_number || 'No plate detected');
           
-          // Return combined result with captured image
           res.json({
             ...parsed,
             captured_image: `data:image/jpg;base64,${captureData.frame}`,
@@ -208,7 +210,6 @@ except Exception as e:
       }
     });
 
-    // Timeout for OCR processing
     setTimeout(() => {
       if (ocrProcess.exitCode === null) {
         ocrProcess.kill();
@@ -220,7 +221,6 @@ except Exception as e:
     }, 60000);
   });
 
-  // Timeout for frame capture
   setTimeout(() => {
     if (captureProcess.exitCode === null) {
       captureProcess.kill();
@@ -232,7 +232,6 @@ except Exception as e:
   }, 30000);
 });
 
-// Get current stream configuration
 app.get('/stream-config', (req, res) => {
   res.json({
     streamUrl: STREAM_URL,

@@ -5,7 +5,7 @@ import { useFocusEffect } from 'expo-router';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
-const BACKEND_URL = 'http://10.0.0.67:8000'; // Update with your computer's IP
+const BACKEND_URL = 'http://10.0.0.66:8000'; // Update with your computer's IP
 
 const US_STATES = [
   'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',

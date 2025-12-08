@@ -6,6 +6,13 @@ import cv2
 import numpy as np
 import easyocr
 import re
+import time
+
+# ============================================================
+# SPECIFICATION CONSTANTS
+# ============================================================
+CONF_THRESHOLD = 0.85  # Minimum confidence for valid detection
+TARGET_LATENCY_MS = 5000  # Target processing time
 
 try:
     reader = easyocr.Reader(['en'])
@@ -24,25 +31,20 @@ def image_to_base64(image):
 
 def light_preprocess(frame):
     """Minimal preprocessing - upscale only"""
-    print("Applying light preprocessing", file=sys.stderr)
     upscaled = cv2.resize(frame, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     return upscaled
 
 def is_license_plate_text(text, area=0):
     """Check if text looks like license plate content"""
-    # Remove spaces for checking
     clean = text.strip().upper().replace(' ', '')
     
-    # License plates typically have alphanumeric characters
     if not clean:
         return False
     
-    # Check if it's mostly alphanumeric (allowing some OCR errors)
     alnum_count = sum(c.isalnum() for c in clean)
-    if alnum_count < len(clean) * 0.7:  # At least 70% alphanumeric
+    if alnum_count < len(clean) * 0.7:
         return False
     
-    # Exclude common non-plate text - expanded list
     excluded_words = ['TENNESSEE', 'VOLUNTEER', 'STATE', 'TRUST', 'GOD', 'WE', 
                       'RUTHERFORD', 'COUNTY', 'IN', 'THE', 'ALABAMA', 'ALASKA',
                       'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO', 'CONNECTICUT',
@@ -53,34 +55,25 @@ def is_license_plate_text(text, area=0):
                       'MEXICO', 'YORK', 'CAROLINA', 'DAKOTA', 'OHIO', 'OKLAHOMA', 'OREGON',
                       'PENNSYLVANIA', 'RHODE', 'ISLAND', 'SOUTH', 'NORTH', 'TEXAS', 'UTAH',
                       'VERMONT', 'VIRGINIA', 'WASHINGTON', 'WEST', 'WISCONSIN', 'WYOMING',
-                      # Additional exclusions for vanity plate text
                       'VACATION', 'TNVACATION', 'WYDIANA', 'LAND', 'LINCOLN', 'COM',
                       'TIST', 'ITH', 'LUMN', 'PAEN', 'AFOD']
     
-    # Check each excluded word
     for word in excluded_words:
         if word in clean or clean in word:
             return False
     
-    # Special check for URLs or domains
     if '.COM' in clean or 'WWW' in clean or 'HTTP' in clean:
         return False
     
-    # Check for likely registration/sticker numbers (7+ consecutive digits with small area)
     if len(clean) >= 7 and clean.isdigit() and area > 0 and area < 50000:
-        return False  # Likely a registration sticker, not the main plate
+        return False
     
-    # License plates are typically 2-10 characters (excluding spaces)
     if len(clean) < 2 or len(clean) > 10:
         return False
     
-    # Additional validation: should have reasonable mix of letters/numbers
-    # Not all letters (unless very short) and not all numbers
     if len(clean) > 3:
         if clean.isalpha() or clean.isdigit():
-            # Long strings of only letters or only numbers are suspicious
-            # unless they're standard formats
-            if not (len(clean) <= 7 and area > 20000):  # Allow if good area
+            if not (len(clean) <= 7 and area > 20000):
                 return False
     
     return True
@@ -90,15 +83,12 @@ def clean_license_text(text):
     if not text:
         return text
     
-    # Remove specific unwanted characters but keep hyphens
-    # Remove: +, *, /, \, |, and other common OCR noise
     unwanted_chars = ['+', '*', '/', '\\', '|', '~', '`', '^', '<', '>', '{', '}', '[', ']', ';', ':', '"', "'", ',', '.', '!', '@', '#', '$', '%', '&', '(', ')']
     
     cleaned = text
     for char in unwanted_chars:
         cleaned = cleaned.replace(char, '')
     
-    # Clean up multiple spaces
     cleaned = ' '.join(cleaned.split())
     
     return cleaned.strip()
@@ -120,7 +110,6 @@ def get_license_plate_candidates(results):
         area = width * height
         center_y = (min_y + max_y) / 2
         
-        # Check if this could be license plate text (pass area for filtering)
         if is_license_plate_text(text, area):
             candidates.append({
                 'text': clean_license_text(text.strip().upper()),
@@ -132,7 +121,6 @@ def get_license_plate_candidates(results):
                 'center_y': center_y,
                 'height': height
             })
-            print(f"License candidate: '{text}' - Area: {area:.0f}, Conf: {confidence:.2f}", file=sys.stderr)
     
     return candidates
 
@@ -141,59 +129,46 @@ def merge_adjacent_candidates(candidates, image_width):
     if not candidates:
         return None
     
-    # Sort by total area (larger areas are more likely to be the main plate)
     candidates_by_area = sorted(candidates, key=lambda x: x['area'], reverse=True)
     
-    # Look for a single dominant candidate
     for candidate in candidates_by_area:
         text = candidate['text'].replace(' ', '')
         has_letters = any(c.isalpha() for c in text)
         has_numbers = any(c.isdigit() for c in text)
         
-        # Check if this single candidate looks like a complete plate
-        # Must have both letters and numbers, reasonable length, and good area
         if (has_letters and has_numbers and 
             4 <= len(text) <= 8 and 
             candidate['area'] > 30000 and
             candidate['confidence'] > 0.5):
             
-            print(f"Using single dominant candidate: '{candidate['text']}'", file=sys.stderr)
             return {
                 'text': candidate['text'],
                 'confidence': candidate['confidence'],
                 'candidates': [candidate]
             }
     
-    # Sort by x-coordinate for grouping adjacent candidates
     candidates = sorted(candidates, key=lambda x: x['min_x'])
     
-    # Group candidates that are on similar horizontal line AND very close together
     groups = []
     for candidate in candidates:
         added_to_group = False
         
         for group in groups:
-            # Check if this candidate is on the same line as the group
             group_center_y = np.mean([c['center_y'] for c in group])
             group_height = np.mean([c['height'] for c in group])
             
-            # Strict vertical alignment (within 30% of height)
             if abs(candidate['center_y'] - group_center_y) < group_height * 0.3:
-                # Check horizontal distance to nearest member
                 distances = []
                 for member in group:
-                    # Distance between closest edges
                     if candidate['min_x'] > member['max_x']:
                         dist = candidate['min_x'] - member['max_x']
                     elif member['min_x'] > candidate['max_x']:
                         dist = member['min_x'] - candidate['max_x']
                     else:
-                        dist = 0  # Overlapping
+                        dist = 0
                     distances.append(dist)
                 
                 min_dist = min(distances)
-                # Very strict proximity - only merge if very close (5% of width or less)
-                # This prevents merging unrelated text like "629" with "TNVACATION" 
                 if min_dist < image_width * 0.05:
                     group.append(candidate)
                     added_to_group = True
@@ -202,100 +177,58 @@ def merge_adjacent_candidates(candidates, image_width):
         if not added_to_group:
             groups.append([candidate])
     
-    # Find the best single candidate or small group
-    best_result = None
-    best_score = 0
+    if not groups:
+        return None
     
-    # First check individual candidates
-    for candidate in candidates:
-        text = candidate['text'].replace(' ', '')
-        has_letters = any(c.isalpha() for c in text)
-        has_numbers = any(c.isdigit() for c in text)
-        
-        # Score individual candidates
-        format_score = 2.0 if (has_letters and has_numbers) else 1.0
-        length_score = 2.0 if 4 <= len(text) <= 8 else 1.0
-        
-        # Penalize very short or very long
-        if len(text) < 3 or len(text) > 10:
-            length_score = 0.3
-            
-        score = candidate['area'] * candidate['confidence'] * format_score * length_score
-        
-        if score > best_score:
-            best_score = score
-            best_result = {
-                'text': candidate['text'],
-                'confidence': candidate['confidence'],
-                'candidates': [candidate]
-            }
+    best_group = max(groups, key=lambda g: sum(c['area'] for c in g))
+    best_group = sorted(best_group, key=lambda x: x['min_x'])
     
-    # Then check small groups (max 2 members to avoid over-merging)
-    for group in groups:
-        if len(group) <= 2:  # Only consider small groups
-            texts = [c['text'] for c in sorted(group, key=lambda x: x['min_x'])]
-            combined_text = ' '.join(texts)
-            clean_text = clean_license_text(combined_text.replace(' ', ''))
-            
-            # Skip if it creates something too long
-            if len(clean_text) > 8:
-                continue
-                
-            total_area = sum(c['area'] for c in group)
-            avg_confidence = np.mean([c['confidence'] for c in group])
-            
-            has_letters = any(c.isalpha() for c in clean_text)
-            has_numbers = any(c.isdigit() for c in clean_text)
-            
-            format_score = 2.0 if (has_letters and has_numbers) else 1.0
-            length_score = 2.0 if 4 <= len(clean_text) <= 8 else 1.0
-            
-            score = total_area * avg_confidence * format_score * length_score
-            
-            print(f"Small group: '{combined_text}' - Score: {score:.0f}", file=sys.stderr)
-            
-            if score > best_score:
-                best_score = score
-                best_result = {
-                    'text': combined_text,
-                    'confidence': avg_confidence,
-                    'candidates': group
-                }
+    merged_text = ' '.join(c['text'] for c in best_group)
+    avg_confidence = np.mean([c['confidence'] for c in best_group])
     
-    return best_result
+    return {
+        'text': merged_text,
+        'confidence': avg_confidence,
+        'candidates': best_group
+    }
 
-def apply_ocr_corrections(text, confidence=1.0):
-    """Apply minimal OCR correction - only clean special characters"""
-    if not text:
+def apply_ocr_corrections(text, confidence):
+    """Apply common OCR corrections"""
+    if confidence > 0.9:
         return text
     
-    # Just clean the text, no character substitutions
-    # Trust the OCR result
-    return clean_license_text(text.upper())
+    corrections = {
+        'O': '0', 'I': '1', 'S': '5', 'B': '8', 'G': '6'
+    }
+    
+    result = list(text.replace(' ', ''))
+    
+    for i, char in enumerate(result):
+        if char in corrections:
+            if i > 0 and result[i-1].isdigit():
+                result[i] = corrections[char]
+            elif i < len(result) - 1 and result[i+1].isdigit():
+                result[i] = corrections[char]
+    
+    return ''.join(result)
 
 def validate_plate_format(text):
-    """Check if the text matches common license plate formats"""
-    if not text:
-        return False
+    """Check if text matches common license plate formats"""
+    clean = text.replace(' ', '').upper()
     
-    clean = text.replace(' ', '').replace('-', '')
-    
-    # Common US license plate patterns
     patterns = [
-        # Standard formats
-        r'^[A-Z]{3}\d{3,4}$',     # ABC 123 or ABC 1234
-        r'^\d{3,4}[A-Z]{3}$',     # 123 ABC or 1234 ABC
-        r'^[A-Z]{2}\d{4,5}$',     # AB 12345
-        r'^[A-Z]{2,3}\d{2,4}[A-Z]?$',  # ABC 12, AB 1234, AB 123 A
-        r'^\d{2,4}[A-Z]{2,3}$',   # 12 ABC, 1234 AB
-        r'^[A-Z0-9]{2,8}$',       # Generic alphanumeric 2-8 chars
+        r'^[A-Z]{3}\d{3,4}$',
+        r'^\d{3,4}[A-Z]{3}$',
+        r'^[A-Z]{2}\d{4,5}$',
+        r'^[A-Z]{2,3}\d{2,4}[A-Z]?$',
+        r'^\d{2,4}[A-Z]{2,3}$',
+        r'^[A-Z0-9]{2,8}$',
     ]
     
     for pattern in patterns:
         if re.match(pattern, clean):
             return True
     
-    # If no pattern matches but it's alphanumeric and reasonable length
     if clean.isalnum() and 2 <= len(clean) <= 8:
         return True
     
@@ -323,7 +256,6 @@ def find_state_name(text):
     for word in words:
         word_upper = word.strip().upper()
         if word_upper in states:
-            print(f"Found state: {word_upper} ({states[word_upper]})", file=sys.stderr)
             return word_upper, states[word_upper]
     
     return None, None
@@ -338,30 +270,19 @@ def classify_results(results, full_text, image_width):
         'plate_confidence': None,
     }
     
-    # Get license plate candidates
     candidates = get_license_plate_candidates(results)
-    
-    # Merge adjacent candidates that might be parts of the same plate
     merged_result = merge_adjacent_candidates(candidates, image_width)
     
     if merged_result:
-        # Apply OCR corrections based on confidence
         original_text = merged_result['text']
         corrected_text = apply_ocr_corrections(original_text, merged_result['confidence'])
-        
-        # Store the plate confidence
         classification['plate_confidence'] = merged_result['confidence']
         
-        # Validate the format
         if validate_plate_format(corrected_text):
             classification['license_number'] = corrected_text
-            print(f"SELECTED LICENSE PLATE: '{corrected_text}' (confidence: {merged_result['confidence']:.2f})", file=sys.stderr)
         else:
-            # Use original if correction fails validation
             classification['license_number'] = original_text
-            print(f"SELECTED LICENSE PLATE: '{original_text}' (confidence: {merged_result['confidence']:.2f})", file=sys.stderr)
     
-    # Find state name separately
     state, state_abbr = find_state_name(full_text)
     if state:
         classification['state'] = state
@@ -370,44 +291,85 @@ def classify_results(results, full_text, image_width):
     return classification
 
 def process_license_plate(frame_base64):
+    # ============================================================
+    # TIMING MEASUREMENTS
+    # ============================================================
+    timing = {
+        'start': time.time(),
+        'decode': 0,
+        'preprocess': 0,
+        'ocr': 0,
+        'classify': 0,
+        'total': 0
+    }
+    
     try:
         if reader is None:
             return {"text": "", "confidence": 0, "error": "EasyOCR not initialized"}
+        
+        # ============================================================
+        # INPUT SPECIFICATIONS
+        # ============================================================
+        print('\n' + '=' * 60, file=sys.stderr)
+        print('🔍 OCR PROCESSING - SPECIFICATION MEASUREMENTS', file=sys.stderr)
+        print('=' * 60, file=sys.stderr)
+        
+        print('\n📥 INPUT SPECIFICATIONS:', file=sys.stderr)
+        print(f'   • Input Format: Base64 encoded JPEG', file=sys.stderr)
+        print(f'   • Input Size: {len(frame_base64) / 1024:.1f} KB (base64)', file=sys.stderr)
         
         # Decode frame
         frame_data = base64.b64decode(frame_base64)
         nparr = np.frombuffer(frame_data, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
+        timing['decode'] = time.time()
+        
         if frame is None:
             return {"text": "", "confidence": 0, "error": "Invalid frame"}
         
-        print(f"Frame shape: {frame.shape}", file=sys.stderr)
+        print(f'   • Image Resolution: {frame.shape[1]}x{frame.shape[0]}', file=sys.stderr)
+        print(f'   • Color Channels: {frame.shape[2]}', file=sys.stderr)
+        print(f'   • Decoded Size: {frame_data.__len__() / 1024:.1f} KB', file=sys.stderr)
+        
         image_width = frame.shape[1]
         raw_frame = frame.copy()
+        
+        # ============================================================
+        # PREPROCESSING PIPELINE
+        # ============================================================
+        print('\n⚙️  PREPROCESSING PIPELINE:', file=sys.stderr)
+        print(f'   • Step 1: Image decode ✓', file=sys.stderr)
         
         # Light preprocessing
         preprocessed = light_preprocess(frame)
         preprocessed_width = preprocessed.shape[1]
         
-        # Run OCR
+        timing['preprocess'] = time.time()
+        
+        print(f'   • Step 2: Upscale (1.5x) → {preprocessed.shape[1]}x{preprocessed.shape[0]} ✓', file=sys.stderr)
+        print(f'   • Step 3: Running EasyOCR...', file=sys.stderr)
+        
+        # ============================================================
+        # OCR ENGINE
+        # ============================================================
         results = reader.readtext(preprocessed)
-        print(f"EasyOCR found {len(results)} text regions", file=sys.stderr)
+        
+        timing['ocr'] = time.time()
+        
+        print(f'   • Step 4: OCR complete - {len(results)} text regions found ✓', file=sys.stderr)
         
         # Create debug images
         debug_images = []
         
-        # Raw image
         raw_b64 = image_to_base64(raw_frame)
         if raw_b64:
             debug_images.append({'name': 'Raw', 'data': raw_b64})
         
-        # Preprocessed image
         preprocess_b64 = image_to_base64(preprocessed)
         if preprocess_b64:
             debug_images.append({'name': 'Preprocessed', 'data': preprocess_b64})
         
-        # Detection visualization
         visualization = preprocessed.copy()
         if len(visualization.shape) == 2:
             visualization = cv2.cvtColor(visualization, cv2.COLOR_GRAY2BGR)
@@ -415,22 +377,33 @@ def process_license_plate(frame_base64):
         detected_texts = []
         confidences = []
         
-        for (bbox, text, confidence) in results:
-            detected_texts.append(text)
-            confidences.append(confidence)
-            
-            # Draw boxes
-            bbox_pts = np.array(bbox, dtype=np.int32)
-            cv2.polylines(visualization, [bbox_pts], True, (0, 255, 0), 2)
-            cv2.putText(visualization, f"{text}", 
-                       (int(bbox_pts[0][0]), int(bbox_pts[0][1]) - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # ============================================================
+        # DETECTION DETAILS
+        # ============================================================
+        if results:
+            print('\n🔎 DETECTED TEXT REGIONS:', file=sys.stderr)
+            for i, (bbox, text, confidence) in enumerate(results):
+                detected_texts.append(text)
+                confidences.append(confidence)
+                
+                bbox_pts = np.array(bbox, dtype=np.int32)
+                cv2.polylines(visualization, [bbox_pts], True, (0, 255, 0), 2)
+                cv2.putText(visualization, f"{text}", 
+                           (int(bbox_pts[0][0]), int(bbox_pts[0][1]) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                print(f'   {i+1}. "{text}" (conf: {confidence:.2f})', file=sys.stderr)
         
         detections_b64 = image_to_base64(visualization)
         if detections_b64:
             debug_images.append({'name': 'Detections', 'data': detections_b64})
         
         if not results:
+            timing['total'] = time.time() - timing['start']
+            
+            print('\n❌ NO TEXT DETECTED', file=sys.stderr)
+            print_timing_summary(timing)
+            
             return {
                 "text": "",
                 "confidence": 0,
@@ -448,28 +421,111 @@ def process_license_plate(frame_base64):
         avg_confidence = np.mean(confidences)
         classification = classify_results(results, full_text, preprocessed_width)
         
-        # Use plate confidence if available, otherwise fall back to average
+        timing['classify'] = time.time()
+        
+        # Use plate confidence if available
         plate_confidence = classification.get('plate_confidence') or avg_confidence
-        quality_status = "Good quality" if plate_confidence > 0.7 else "Low confidence"
         
-        print(f"Full text: '{full_text}'", file=sys.stderr)
-        print(f"Plate confidence: {plate_confidence:.2f}", file=sys.stderr)
-        print(f"Classification: {classification}", file=sys.stderr)
+        # ============================================================
+        # OUTPUT SPECIFICATIONS
+        # ============================================================
+        print('\n📤 OUTPUT SPECIFICATIONS:', file=sys.stderr)
+        print('   ┌─────────────────────────────────────────┐', file=sys.stderr)
         
-        return {
+        plate_text = classification.get('license_number') or 'NOT DETECTED'
+        state_text = classification.get('state_abbreviation') or 'N/A'
+        conf_text = f'{plate_confidence * 100:.1f}%'
+        
+        print(f'   │  PLATE:      {plate_text:<26} │', file=sys.stderr)
+        print(f'   │  STATE:      {state_text:<26} │', file=sys.stderr)
+        print(f'   │  CONFIDENCE: {conf_text:<26} │', file=sys.stderr)
+        print('   └─────────────────────────────────────────┘', file=sys.stderr)
+        
+        # Confidence threshold check
+        if plate_confidence >= CONF_THRESHOLD:
+            print(f'   ✅ PASSED confidence threshold (≥{CONF_THRESHOLD*100:.0f}%)', file=sys.stderr)
+            quality_status = "Good quality"
+        else:
+            print(f'   ⚠️  BELOW confidence threshold (<{CONF_THRESHOLD*100:.0f}%) - Needs Review', file=sys.stderr)
+            quality_status = "Low confidence"
+        
+        # ============================================================
+        # TIMING MEASUREMENTS
+        # ============================================================
+        timing['total'] = time.time() - timing['start']
+        print_timing_summary(timing)
+        
+        # ============================================================
+        # JSON OUTPUT
+        # ============================================================
+        result = {
             "text": full_text,
             "confidence": float(plate_confidence),
             "quality_status": quality_status,
             "classification": classification,
             "debug_images": debug_images,
-            "success": True
+            "success": True,
+            "timing_ms": {
+                "decode": int((timing['decode'] - timing['start']) * 1000),
+                "preprocess": int((timing['preprocess'] - timing['decode']) * 1000),
+                "ocr": int((timing['ocr'] - timing['preprocess']) * 1000),
+                "classify": int((timing['classify'] - timing['ocr']) * 1000),
+                "total": int(timing['total'] * 1000)
+            }
         }
+        
+        print('\n📋 JSON OUTPUT FORMAT:', file=sys.stderr)
+        output_summary = {
+            "success": result["success"],
+            "confidence": result["confidence"],
+            "classification": result["classification"],
+            "timing_ms": result["timing_ms"]
+        }
+        print(json.dumps(output_summary, indent=2), file=sys.stderr)
+        print('=' * 60 + '\n', file=sys.stderr)
+        
+        return result
     
     except Exception as e:
-        print(f"Exception: {str(e)}", file=sys.stderr)
+        timing['total'] = time.time() - timing['start']
+        
+        print(f'\n❌ ERROR: {str(e)}', file=sys.stderr)
+        print(f'   Time to error: {timing["total"]*1000:.0f}ms', file=sys.stderr)
+        print('=' * 60 + '\n', file=sys.stderr)
+        
         import traceback
         traceback.print_exc(file=sys.stderr)
         return {"text": "", "confidence": 0, "error": str(e), "success": False}
+
+def print_timing_summary(timing):
+    """Print formatted timing summary"""
+    total_ms = timing['total'] * 1000
+    
+    print('\n⏱️  TIMING MEASUREMENTS:', file=sys.stderr)
+    
+    if timing['decode'] > 0:
+        decode_ms = (timing['decode'] - timing['start']) * 1000
+        print(f'   • Image Decode:     {decode_ms:>6.0f} ms', file=sys.stderr)
+    
+    if timing['preprocess'] > 0:
+        preprocess_ms = (timing['preprocess'] - timing['decode']) * 1000
+        print(f'   • Preprocessing:    {preprocess_ms:>6.0f} ms', file=sys.stderr)
+    
+    if timing['ocr'] > 0:
+        ocr_ms = (timing['ocr'] - timing['preprocess']) * 1000
+        print(f'   • OCR Engine:       {ocr_ms:>6.0f} ms', file=sys.stderr)
+    
+    if timing['classify'] > 0:
+        classify_ms = (timing['classify'] - timing['ocr']) * 1000
+        print(f'   • Classification:   {classify_ms:>6.0f} ms', file=sys.stderr)
+    
+    print('   ' + '─' * 30, file=sys.stderr)
+    print(f'   • TOTAL TIME:       {total_ms:>6.0f} ms', file=sys.stderr)
+    
+    if total_ms <= TARGET_LATENCY_MS:
+        print(f'   ✅ Within target latency (≤{TARGET_LATENCY_MS}ms)', file=sys.stderr)
+    else:
+        print(f'   ⚠️  Exceeded target latency (>{TARGET_LATENCY_MS}ms)', file=sys.stderr)
 
 if __name__ == '__main__':
     try:

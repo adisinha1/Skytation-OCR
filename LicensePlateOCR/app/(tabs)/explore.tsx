@@ -12,13 +12,8 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import { useFocusEffect } from 'expo-router';
-import {
-  getZones,
-  saveZone,
-  deleteZone,
-  clearAllZones,
-  CampusZone,
-} from '@/app/campusZones';
+
+const BACKEND_URL = 'http://10.0.0.66:8000'; // Update with your computer's IP
 
 // Only import WebView on native platforms
 let WebView: any = null;
@@ -26,20 +21,33 @@ if (Platform.OS !== 'web') {
   WebView = require('react-native-webview').WebView;
 }
 
+interface Zone {
+  id: number;
+  name: string;
+  code: string;
+  latitude: number;
+  longitude: number;
+  radius: number;
+  zone_type: string;
+  default_time_limit: number;
+}
+
 export default function ZonesScreen() {
   const webViewRef = useRef<any>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [zones, setZones] = useState<CampusZone[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState<{
     latitude: number;
     longitude: number;
   } | null>(null);
-  const [mapKey, setMapKey] = useState(0); // For forcing map refresh
+  const [mapKey, setMapKey] = useState(0);
   
   // Form state
   const [zoneName, setZoneName] = useState('');
   const [zoneCode, setZoneCode] = useState('');
+  const [zoneType, setZoneType] = useState<'permit' | 'timed'>('timed');
+  const [defaultTimeLimit, setDefaultTimeLimit] = useState(120);
   
   // Map center (default: Purdue University area)
   const [mapCenter, setMapCenter] = useState({
@@ -48,9 +56,16 @@ export default function ZonesScreen() {
   });
 
   const loadZones = async () => {
-    const loadedZones = await getZones();
-    setZones(loadedZones);
-    setMapKey(prev => prev + 1); // Refresh map when zones change
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/zones`);
+      if (response.ok) {
+        const loadedZones = await response.json();
+        setZones(loadedZones);
+        setMapKey(prev => prev + 1);
+      }
+    } catch (error) {
+      console.error('Error loading zones:', error);
+    }
   };
 
   useFocusEffect(
@@ -64,10 +79,10 @@ export default function ZonesScreen() {
     const markersJS = zones.map(zone => `
       L.marker([${zone.latitude}, ${zone.longitude}])
         .addTo(map)
-        .bindPopup('<b>${zone.name}</b><br>${zone.code}');
+        .bindPopup('<b>${zone.name}</b><br>${zone.code}<br>${zone.zone_type} - ${zone.default_time_limit}min');
       L.circle([${zone.latitude}, ${zone.longitude}], {
-        color: '#007AFF',
-        fillColor: '#007AFF',
+        color: '${zone.zone_type === 'permit' ? '#007AFF' : '#4CAF50'}',
+        fillColor: '${zone.zone_type === 'permit' ? '#007AFF' : '#4CAF50'}',
         fillOpacity: 0.2,
         radius: 50
       }).addTo(map);
@@ -94,10 +109,8 @@ export default function ZonesScreen() {
             attribution: '© OpenStreetMap contributors'
           }).addTo(map);
           
-          // Add existing zone markers
           ${markersJS}
           
-          // Handle map clicks
           map.on('click', function(e) {
             var message = JSON.stringify({
               type: 'mapClick',
@@ -105,22 +118,17 @@ export default function ZonesScreen() {
               longitude: e.latlng.lng
             });
             
-            // For React Native WebView
             if (window.ReactNativeWebView) {
               window.ReactNativeWebView.postMessage(message);
-            }
-            // For web iframe
-            else if (window.parent !== window) {
+            } else if (window.parent !== window) {
               window.parent.postMessage(message, '*');
             }
           });
           
-          // Function to center map
           function centerMap(lat, lng) {
             map.setView([lat, lng], 16);
           }
           
-          // Function to add temporary marker for selection
           var tempMarker = null;
           function showTempMarker(lat, lng) {
             if (tempMarker) {
@@ -136,7 +144,6 @@ export default function ZonesScreen() {
             }).addTo(map);
           }
           
-          // Listen for messages from parent (for web)
           window.addEventListener('message', function(event) {
             try {
               var data = JSON.parse(event.data);
@@ -153,7 +160,6 @@ export default function ZonesScreen() {
     `;
   };
 
-  // Handle messages from map (both WebView and iframe)
   const handleMapMessage = (data: any) => {
     if (data.type === 'mapClick') {
       setSelectedLocation({
@@ -162,7 +168,6 @@ export default function ZonesScreen() {
       });
       setShowAddModal(true);
       
-      // Show temporary marker
       if (Platform.OS === 'web') {
         iframeRef.current?.contentWindow?.postMessage(
           JSON.stringify({ type: 'showTempMarker', latitude: data.latitude, longitude: data.longitude }),
@@ -186,7 +191,6 @@ export default function ZonesScreen() {
     }
   };
 
-  // Set up web message listener
   React.useEffect(() => {
     if (Platform.OS === 'web') {
       const handleMessage = (event: MessageEvent) => {
@@ -214,7 +218,6 @@ export default function ZonesScreen() {
       
       setMapCenter({ latitude, longitude });
       
-      // Center the map
       if (Platform.OS === 'web') {
         iframeRef.current?.contentWindow?.postMessage(
           JSON.stringify({ type: 'centerMap', latitude, longitude }),
@@ -242,22 +245,39 @@ export default function ZonesScreen() {
       return;
     }
 
-    await saveZone({
-      name: zoneName,
-      code: zoneCode,
-      latitude: selectedLocation.latitude,
-      longitude: selectedLocation.longitude,
-      radius: 0.0005,
-    });
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/zones`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: zoneName,
+          code: zoneCode,
+          latitude: selectedLocation.latitude,
+          longitude: selectedLocation.longitude,
+          radius: 0.0005,
+          zone_type: zoneType,
+          default_time_limit: defaultTimeLimit,
+        }),
+      });
 
-    setZoneName('');
-    setZoneCode('');
-    setSelectedLocation(null);
-    setShowAddModal(false);
-    await loadZones();
+      if (response.ok) {
+        setZoneName('');
+        setZoneCode('');
+        setZoneType('timed');
+        setDefaultTimeLimit(120);
+        setSelectedLocation(null);
+        setShowAddModal(false);
+        await loadZones();
+      } else {
+        const error = await response.json();
+        Alert.alert('Error', error.detail || 'Failed to add zone');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add zone: ' + String(error));
+    }
   };
 
-  const handleDeleteZone = async (id: string) => {
+  const handleDeleteZone = async (id: number) => {
     Alert.alert(
       'Delete Zone',
       'Are you sure you want to delete this zone?',
@@ -267,8 +287,18 @@ export default function ZonesScreen() {
           text: 'Delete',
           style: 'destructive',
           onPress: async () => {
-            await deleteZone(id);
-            await loadZones();
+            try {
+              const response = await fetch(`${BACKEND_URL}/api/zones/${id}`, {
+                method: 'DELETE',
+              });
+              if (response.ok) {
+                await loadZones();
+              } else {
+                Alert.alert('Error', 'Failed to delete zone');
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Failed to delete zone: ' + String(error));
+            }
           },
         },
       ]
@@ -285,15 +315,37 @@ export default function ZonesScreen() {
           text: 'Clear All',
           style: 'destructive',
           onPress: async () => {
-            await clearAllZones();
-            await loadZones();
+            try {
+              const response = await fetch(`${BACKEND_URL}/api/zones/clear`, {
+                method: 'DELETE',
+              });
+              if (response.ok) {
+                await loadZones();
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Failed to clear zones');
+            }
           },
         },
       ]
     );
   };
 
-  // Render map based on platform
+  const handleSeedZones = async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/zones/seed`, {
+        method: 'POST',
+      });
+      if (response.ok) {
+        const result = await response.json();
+        Alert.alert('Success', result.message);
+        await loadZones();
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Failed to seed zones');
+    }
+  };
+
   const renderMap = () => {
     if (Platform.OS === 'web') {
       return (
@@ -351,14 +403,24 @@ export default function ZonesScreen() {
       <View style={styles.zoneListContainer}>
         <View style={styles.zoneListHeader}>
           <Text style={styles.zoneListTitle}>Zones ({zones.length})</Text>
-          {zones.length > 0 && (
-            <TouchableOpacity
-              style={styles.clearAllButton}
-              onPress={handleClearAll}
-            >
-              <Text style={styles.clearAllButtonText}>Clear All</Text>
-            </TouchableOpacity>
-          )}
+          <View style={styles.headerButtons}>
+            {zones.length === 0 && (
+              <TouchableOpacity
+                style={styles.seedButton}
+                onPress={handleSeedZones}
+              >
+                <Text style={styles.seedButtonText}>Seed Sample</Text>
+              </TouchableOpacity>
+            )}
+            {zones.length > 0 && (
+              <TouchableOpacity
+                style={styles.clearAllButton}
+                onPress={handleClearAll}
+              >
+                <Text style={styles.clearAllButtonText}>Clear All</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
 
         <ScrollView 
@@ -367,14 +429,25 @@ export default function ZonesScreen() {
         >
           {zones.length === 0 ? (
             <Text style={styles.emptyText}>
-              No zones configured. Tap on the map to add one.
+              No zones configured. Tap on the map to add one or seed sample zones.
             </Text>
           ) : (
             zones.map((zone) => (
               <View key={zone.id} style={styles.zoneCard}>
                 <View style={styles.zoneInfo}>
                   <Text style={styles.zoneName}>{zone.name}</Text>
-                  <Text style={styles.zoneCode}>{zone.code}</Text>
+                  <View style={styles.zoneMetaRow}>
+                    <Text style={styles.zoneCode}>{zone.code}</Text>
+                    <Text style={[
+                      styles.zoneType,
+                      zone.zone_type === 'permit' ? styles.zoneTypePermit : styles.zoneTypeTimed
+                    ]}>
+                      {zone.zone_type}
+                    </Text>
+                    {zone.zone_type === 'timed' && (
+                      <Text style={styles.zoneTimeLimit}>{zone.default_time_limit}min</Text>
+                    )}
+                  </View>
                   <Text style={styles.zoneCoords}>
                     {zone.latitude.toFixed(5)}, {zone.longitude.toFixed(5)}
                   </Text>
@@ -427,6 +500,67 @@ export default function ZonesScreen() {
               />
             </View>
 
+            {/* Zone Type Toggle */}
+            <View style={styles.inputGroup}>
+              <Text style={styles.inputLabel}>Zone Type</Text>
+              <View style={styles.zoneTypeToggle}>
+                <TouchableOpacity
+                  style={[
+                    styles.zoneTypeButton,
+                    zoneType === 'permit' && styles.zoneTypeButtonActive
+                  ]}
+                  onPress={() => setZoneType('permit')}
+                >
+                  <Text style={[
+                    styles.zoneTypeButtonText,
+                    zoneType === 'permit' && styles.zoneTypeButtonTextActive
+                  ]}>
+                    Permit
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.zoneTypeButton,
+                    zoneType === 'timed' && styles.zoneTypeButtonActive
+                  ]}
+                  onPress={() => setZoneType('timed')}
+                >
+                  <Text style={[
+                    styles.zoneTypeButtonText,
+                    zoneType === 'timed' && styles.zoneTypeButtonTextActive
+                  ]}>
+                    Timed
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Time Limit (for timed zones) */}
+            {zoneType === 'timed' && (
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Default Time Limit (minutes)</Text>
+                <View style={styles.timeLimitOptions}>
+                  {[30, 60, 120, 240].map((mins) => (
+                    <TouchableOpacity
+                      key={mins}
+                      style={[
+                        styles.timeLimitButton,
+                        defaultTimeLimit === mins && styles.timeLimitButtonActive
+                      ]}
+                      onPress={() => setDefaultTimeLimit(mins)}
+                    >
+                      <Text style={[
+                        styles.timeLimitButtonText,
+                        defaultTimeLimit === mins && styles.timeLimitButtonTextActive
+                      ]}>
+                        {mins < 60 ? `${mins}m` : `${mins/60}h`}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+            )}
+
             {selectedLocation && (
               <View style={styles.coordsDisplay}>
                 <Text style={styles.coordsLabel}>Location</Text>
@@ -449,6 +583,8 @@ export default function ZonesScreen() {
                   setShowAddModal(false);
                   setZoneName('');
                   setZoneCode('');
+                  setZoneType('timed');
+                  setDefaultTimeLimit(120);
                   setSelectedLocation(null);
                 }}
               >
@@ -510,7 +646,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   zoneListContainer: {
-    maxHeight: 250,
+    maxHeight: 280,
     backgroundColor: '#1a1a1a',
     borderTopWidth: 1,
     borderTopColor: '#333',
@@ -527,6 +663,21 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  headerButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  seedButton: {
+    backgroundColor: '#4CAF50',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  seedButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
   clearAllButton: {
     backgroundColor: '#FF3B30',
@@ -561,11 +712,35 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: 'bold',
   },
+  zoneMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 4,
+  },
   zoneCode: {
     color: '#007AFF',
     fontSize: 12,
     fontWeight: '600',
-    marginTop: 2,
+  },
+  zoneType: {
+    fontSize: 10,
+    fontWeight: '600',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  zoneTypePermit: {
+    backgroundColor: '#007AFF',
+    color: '#FFF',
+  },
+  zoneTypeTimed: {
+    backgroundColor: '#4CAF50',
+    color: '#FFF',
+  },
+  zoneTimeLimit: {
+    color: '#888',
+    fontSize: 10,
   },
   zoneCoords: {
     color: '#666',
@@ -631,6 +806,57 @@ const styles = StyleSheet.create({
     padding: 12,
     color: '#FFF',
     fontSize: 14,
+  },
+  zoneTypeToggle: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  zoneTypeButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333',
+    alignItems: 'center',
+    backgroundColor: '#000',
+  },
+  zoneTypeButtonActive: {
+    backgroundColor: '#007AFF',
+    borderColor: '#007AFF',
+  },
+  zoneTypeButtonText: {
+    color: '#888',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  zoneTypeButtonTextActive: {
+    color: '#FFF',
+  },
+  timeLimitOptions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  timeLimitButton: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#333',
+    alignItems: 'center',
+    backgroundColor: '#000',
+  },
+  timeLimitButtonActive: {
+    backgroundColor: '#4CAF50',
+    borderColor: '#4CAF50',
+  },
+  timeLimitButtonText: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  timeLimitButtonTextActive: {
+    color: '#FFF',
   },
   coordsDisplay: {
     backgroundColor: '#000',

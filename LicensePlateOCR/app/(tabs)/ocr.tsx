@@ -1,7 +1,8 @@
-import React, { useState, useRef } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView, Image, Modal, Dimensions, Platform } from 'react-native';
+import React, { useState, useRef, useEffect } from 'react';
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView, Image, Modal, Dimensions, Platform, Alert } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { saveScan } from '@/app/scanStorage';
+import * as Location from 'expo-location';
 
 interface Classification {
   state: string | null;
@@ -23,9 +24,20 @@ interface LastCapture {
   timestamp: Date;
 }
 
+interface EnforcementResult {
+  result: 'approved' | 'violation' | 'unknown';
+  reason: string;
+  message: string;
+  detected_zone?: string;
+  zone_type?: 'permit' | 'timed';
+  dwell_minutes?: number;
+  limit_minutes?: number;
+}
+
 export default function OCRScreen() {
   const cameraRef = useRef<CameraView>(null);
   const [permission, requestPermission] = useCameraPermissions();
+  const [locationPermission, setLocationPermission] = useState<Location.PermissionStatus | null>(null);
   
   // State declarations
   const [isProcessing, setIsProcessing] = useState(false);
@@ -38,14 +50,23 @@ export default function OCRScreen() {
   const [debugImages, setDebugImages] = useState<Array<{name: string, data: string}>>([]);
   const [currentDebugImageIndex, setCurrentDebugImageIndex] = useState(0);
   const [captureSource, setCaptureSource] = useState<'phone' | 'drone'>('phone');
+  const [enforcementResult, setEnforcementResult] = useState<EnforcementResult | null>(null);
   
   // New state for last capture modal
   const [lastCapture, setLastCapture] = useState<LastCapture | null>(null);
   const [showLastCaptureModal, setShowLastCaptureModal] = useState(false);
   const [lastCaptureDebugIndex, setLastCaptureDebugIndex] = useState(0);
 
-  const BACKEND_URL = 'http://10.0.0.67:5001';
-  const ENFORCEMENT_URL = 'http://10.0.0.67:8000';
+  const BACKEND_URL = 'http://10.0.0.66:5001';
+  const ENFORCEMENT_URL = 'http://10.0.0.66:8000';
+
+  // Request location permissions on mount
+  useEffect(() => {
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      setLocationPermission(status);
+    })();
+  }, []);
 
   React.useEffect(() => {
     if (!permission?.granted) {
@@ -53,24 +74,75 @@ export default function OCRScreen() {
     }
   }, [permission]);
 
-  const logToEnforcement = async (plateNumber: string, state: string | null, confidence: number, source: 'phone' | 'drone') => {
+  const getCurrentLocation = async () => {
     try {
-      await fetch(`${ENFORCEMENT_URL}/api/ocr_event`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          plate_text: plateNumber,
-          confidence: confidence,
-          timestamp: new Date().toISOString(),
-          location: 'timed',
-          state: state,
-          source: source,
-        }),
+      // Check if we already have permission
+      if (locationPermission !== 'granted') {
+        console.log('Location permission not granted');
+        return null;
+      }
+
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
       });
+      
+      return {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      };
     } catch (error) {
-      console.error('Error logging to enforcement:', error);
+      console.error('Error getting location:', error);
+      return null;
     }
   };
+  
+  const logToEnforcement = async (
+    plateNumber: string, 
+    state: string | null, 
+    confidence: number, 
+    source: 'phone' | 'drone',
+    imageData?: string
+  ) => {
+      try {
+        // Get current GPS location
+        const location = await getCurrentLocation();
+        
+        const response = await fetch(`${ENFORCEMENT_URL}/api/ocr_event`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            plate_text: plateNumber,
+            confidence: confidence,
+            timestamp: new Date().toISOString(),
+            location: 'timed', // Will be auto-detected by backend based on GPS
+            state: state,
+            source: source,
+            image_data: imageData,
+            latitude: location?.latitude,
+            longitude: location?.longitude,
+          }),
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          setEnforcementResult(result);
+          
+          // Show alert for violations
+          if (result.result === 'violation') {
+            Alert.alert(
+              '⚠️ VIOLATION DETECTED',
+              result.message,
+              [{ text: 'OK', style: 'destructive' }]
+            );
+          }
+          
+          return result;
+        }
+      } catch (error) {
+        console.error('Error logging to enforcement:', error);
+      }
+      return null;
+    };
 
   const saveToLastCapture = (photo: string, classificationData: Classification | null, text: string, conf: number, quality: string, debugImgs: Array<{name: string, data: string}>, source: 'phone' | 'drone') => {
     setLastCapture({
@@ -93,6 +165,7 @@ export default function OCRScreen() {
       setClassification(null);
       setRawText('Focusing...');
       setCaptureSource('phone');
+      setEnforcementResult(null);
 
       await new Promise(resolve => setTimeout(resolve, 500));
 
@@ -145,7 +218,8 @@ export default function OCRScreen() {
             classData.license_number,
             classData.state_abbreviation,
             conf,
-            'phone'
+            'phone',
+            photo.base64 
           );
         }
       } else {
@@ -168,6 +242,7 @@ export default function OCRScreen() {
       setRawText('Capturing from drone...');
       setCaptureSource('drone');
       setLastPhoto(null);
+      setEnforcementResult(null);
 
       const response = await fetch(`${BACKEND_URL}/capture-drone`, {
         method: 'POST',
@@ -213,7 +288,8 @@ export default function OCRScreen() {
             classData.license_number,
             classData.state_abbreviation,
             conf,
-            'drone'
+            'drone',
+            data.captured_image?.replace('data:image/jpg;base64,', '')
           );
         }
       } else {
@@ -236,6 +312,7 @@ export default function OCRScreen() {
     setLastQuality('');
     setDebugImages([]);
     setCurrentDebugImageIndex(0);
+    setEnforcementResult(null);
   };
 
   const renderLastCaptureModal = () => (
@@ -393,7 +470,7 @@ export default function OCRScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Camera or Debug Section - Now takes more space */}
+      {/* Camera or Debug Section */}
       {!lastPhoto ? (
         <CameraView ref={cameraRef} style={styles.camera} facing="back">
           <View style={styles.cameraOverlay}>
@@ -442,8 +519,35 @@ export default function OCRScreen() {
         </View>
       )}
 
-      {/* Results Panel - Compact */}
+      {/* Results Panel */}
       <ScrollView style={styles.resultsPanel}>
+        {/* Enforcement Result Banner */}
+        {enforcementResult && (
+          <View style={[
+            styles.enforcementBanner,
+            enforcementResult.result === 'violation' ? styles.violationBanner :
+            enforcementResult.result === 'approved' ? styles.approvedBanner :
+            styles.unknownBanner
+          ]}>
+            <Text style={styles.enforcementResultText}>
+              {enforcementResult.result === 'violation' ? '⚠️ VIOLATION' :
+               enforcementResult.result === 'approved' ? '✅ APPROVED' :
+               '⚠️ NEEDS REVIEW'}
+            </Text>
+            <Text style={styles.enforcementMessageText}>{enforcementResult.message}</Text>
+            {enforcementResult.detected_zone && (
+              <Text style={styles.enforcementZoneText}>
+                Zone: {enforcementResult.detected_zone} ({enforcementResult.zone_type})
+              </Text>
+            )}
+            {enforcementResult.dwell_minutes !== undefined && enforcementResult.limit_minutes !== undefined && (
+              <Text style={styles.enforcementTimerText}>
+                Time: {enforcementResult.dwell_minutes.toFixed(0)}m / {enforcementResult.limit_minutes}m
+              </Text>
+            )}
+          </View>
+        )}
+
         {lastQuality && (
           <Text style={styles.qualityText}>{lastQuality}</Text>
         )}
@@ -680,9 +784,47 @@ const styles = StyleSheet.create({
     color: '#555',
   },
   resultsPanel: {
-    maxHeight: 200,
+    maxHeight: 280,
     backgroundColor: '#1a1a1a',
     padding: 14,
+  },
+  enforcementBanner: {
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 2,
+  },
+  violationBanner: {
+    backgroundColor: '#4A0000',
+    borderColor: '#FF3B30',
+  },
+  approvedBanner: {
+    backgroundColor: '#003A00',
+    borderColor: '#4CAF50',
+  },
+  unknownBanner: {
+    backgroundColor: '#4A3500',
+    borderColor: '#FFA500',
+  },
+  enforcementResultText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  enforcementMessageText: {
+    color: '#FFF',
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  enforcementZoneText: {
+    color: '#CCC',
+    fontSize: 11,
+    marginTop: 4,
+  },
+  enforcementTimerText: {
+    color: '#CCC',
+    fontSize: 11,
   },
   qualityText: {
     color: '#FFA500',
@@ -822,7 +964,6 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontSize: 14,
   },
-  // Modal styles
   modalContainer: {
     flex: 1,
     backgroundColor: '#000',
